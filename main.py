@@ -3,12 +3,13 @@ import asyncio
 import logging
 import os
 from datetime import datetime
+from typing import Any, Awaitable, Callable, Dict
 
 import aiosqlite
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import BaseFilter, Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -20,12 +21,12 @@ from aiogram.types import (
 )
 
 # ==========================================================
-# КОНФИГ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ
+# КОНФИГ
 # ==========================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SUPER_ADMIN_ID = int(os.getenv("SUPER_ADMIN_ID", "0"))
 REPORT_GROUP_URL = os.getenv("REPORT_GROUP_URL", "https://t.me/")
-EVIDENCE_GROUP_URL = os.getenv("EVIDENCE_GROUP_URL", REPORT_GROUP_URL)  # одна группа
+EVIDENCE_GROUP_URL = os.getenv("EVIDENCE_GROUP_URL", REPORT_GROUP_URL)
 DB_PATH = os.getenv("DB_PATH", "data/antiscam.db")
 
 if not BOT_TOKEN:
@@ -58,10 +59,27 @@ logging.basicConfig(
 )
 log = logging.getLogger("antiscam")
 
+
+# ==========================================================
+# ФИЛЬТРЫ
+# ==========================================================
+class IsSuperAdmin(BaseFilter):
+    async def __call__(self, event) -> bool:
+        user = getattr(event, "from_user", None)
+        return bool(user and user.id == SUPER_ADMIN_ID)
+
+
+class IsNotSuperAdmin(BaseFilter):
+    async def __call__(self, event) -> bool:
+        user = getattr(event, "from_user", None)
+        return bool(user and user.id != SUPER_ADMIN_ID)
+
+
 # ==========================================================
 # БАЗА ДАННЫХ
 # ==========================================================
 async def init_db():
+    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -103,9 +121,11 @@ async def init_db():
         )
         """)
         await db.commit()
+    log.info("База данных готова: %s", DB_PATH)
 
 
 async def upsert_user(user_id, username=None, full_name=None):
+    """Автосохранение. НЕ перетирает статус, только обновляет username/имя."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             INSERT INTO users (user_id, username, full_name, status, updated_at)
@@ -131,8 +151,7 @@ async def get_user_by_username(username):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
-            "SELECT * FROM users WHERE LOWER(username)=LOWER(?)",
-            (username,))
+            "SELECT * FROM users WHERE LOWER(username)=LOWER(?)", (username,))
         row = await cur.fetchone()
         return dict(row) if row else None
 
@@ -205,11 +224,64 @@ async def register_chat(chat_id, title):
         await db.commit()
 
 
-async def all_chats():
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT chat_id, title FROM chats")
-        return [dict(r) for r in await cur.fetchall()]
+# ==========================================================
+# АВТО-СОХРАНЕНИЕ ЛЮБОГО УПОМЯНУТОГО ПОЛЬЗОВАТЕЛЯ
+# ==========================================================
+async def auto_save_from_message(message: Message):
+    """
+    Сохраняет всех, о ком есть инфа в сообщении:
+    - автора
+    - того, кому отвечают (reply)
+    - пересланного (forward)
+    - упомянутых через entities (text_mention)
+    """
+    saved = set()
+
+    async def save(u):
+        if not u or u.is_bot or u.id in saved:
+            return
+        saved.add(u.id)
+        await upsert_user(u.id, u.username, u.full_name)
+
+    if message.from_user:
+        await save(message.from_user)
+
+    if message.reply_to_message and message.reply_to_message.from_user:
+        await save(message.reply_to_message.from_user)
+
+    if message.forward_from:
+        await save(message.forward_from)
+
+    if message.entities:
+        for ent in message.entities:
+            if ent.type == "text_mention" and ent.user:
+                await save(ent.user)
+
+    if message.caption_entities:
+        for ent in message.caption_entities:
+            if ent.type == "text_mention" and ent.user:
+                await save(ent.user)
+
+
+class AutoRegisterMiddleware(BaseMiddleware):
+    """
+    Срабатывает на КАЖДОЕ сообщение/колбэк/чат-событие.
+    Автоматически сохраняет всех, кого видит.
+    """
+    async def __call__(self, handler, event, data):
+        try:
+            if isinstance(event, Message):
+                await auto_save_from_message(event)
+            elif isinstance(event, CallbackQuery) and event.from_user:
+                await upsert_user(event.from_user.id,
+                                  event.from_user.username,
+                                  event.from_user.full_name)
+            elif isinstance(event, ChatMemberUpdated):
+                u = event.new_chat_member.user
+                await upsert_user(u.id, u.username, u.full_name)
+        except Exception as e:
+            log.warning("AutoRegister: %s", e)
+        return await handler(event, data)
 
 
 # ==========================================================
@@ -255,10 +327,7 @@ def status_choice_kb(prefix):
 
 def profile_kb(user_id, evidence_url, username):
     rows = []
-    if username:
-        link = f"https://t.me/{username}"
-    else:
-        link = f"tg://user?id={user_id}"
+    link = f"https://t.me/{username}" if username else f"tg://user?id={user_id}"
     rows.append([InlineKeyboardButton(text="👤 Открыть профиль", url=link)])
     if evidence_url:
         rows.append([InlineKeyboardButton(text="📎 Доказательства",
@@ -298,20 +367,18 @@ router_admin = Router()
 router_group = Router()
 router_user = Router()
 
-
-def is_super_admin(user_id: int) -> bool:
-    return user_id == SUPER_ADMIN_ID
+# Автосохранение на всех роутерах
+router_user.message.outer_middleware(AutoRegisterMiddleware())
+router_user.callback_query.outer_middleware(AutoRegisterMiddleware())
+router_group.message.outer_middleware(AutoRegisterMiddleware())
+router_group.callback_query.outer_middleware(AutoRegisterMiddleware())
+router_group.chat_member.outer_middleware(AutoRegisterMiddleware())
 
 
 # ---------------- USER ----------------
-@router_user.message(CommandStart())
+@router_user.message(CommandStart(), IsNotSuperAdmin())
 async def user_start(message: Message, state: FSMContext):
-    if is_super_admin(message.from_user.id):
-        return
     await state.clear()
-    await upsert_user(message.from_user.id,
-                      message.from_user.username,
-                      message.from_user.full_name)
     await message.answer(
         "👋 Привет! Я антискам-бот.\n\n"
         "Помогаю собирать информацию о скамерах и проверять пользователей.\n"
@@ -463,10 +530,16 @@ async def cmd_check(message: Message):
     if not user and target_username:
         user = await get_user_by_username(target_username)
 
+    # Если нашли по username — берём реальный ID из базы
+    if user:
+        target_id = user["user_id"]
+        target_username = user.get("username") or target_username
+        target_name = user.get("full_name") or target_name
+
     status = user["status"] if user else STATUS_NORMAL
-    display_name = (user["full_name"] if user else target_name) or "—"
-    display_username = (user["username"] if user else target_username) or "—"
-    display_id = (user["user_id"] if user else target_id) or "—"
+    display_id = target_id if target_id else "—"
+    display_name = target_name or "—"
+    display_username = target_username or "—"
 
     text = (
         f"📇 <b>Проверка</b>\n"
@@ -477,13 +550,17 @@ async def cmd_check(message: Message):
     )
     if user and user.get("reason"):
         text += f"Причина: {user['reason']}\n"
+    if not user:
+        text += ("\n<i>ℹ️ Пользователя пока нет в базе. "
+                 "Он автоматически появится, как только напишет в эту группу "
+                 "или боту.</i>")
 
     await message.reply(
         text,
         reply_markup=profile_kb(
-            display_id if isinstance(display_id, int) else 0,
+            target_id if target_id else 0,
             user.get("evidence_url") if user else None,
-            display_username if display_username != "—" else None,
+            target_username if target_username else None,
         )
     )
 
@@ -507,26 +584,19 @@ async def bot_added(event: ChatMemberUpdated):
 
 
 # ---------------- ADMIN ----------------
-@router_admin.message(CommandStart())
+@router_admin.message(CommandStart(), IsSuperAdmin())
 async def admin_start(message: Message, state: FSMContext):
-    if not is_super_admin(message.from_user.id):
-        return
     await state.clear()
     await message.answer("🛠 <b>Админ-панель</b>", reply_markup=admin_menu())
 
 
-@router_admin.message(Command("admin"))
+@router_admin.message(Command("admin"), IsSuperAdmin())
 async def admin_cmd(message: Message):
-    if not is_super_admin(message.from_user.id):
-        return
     await message.answer("🛠 Админ-панель", reply_markup=admin_menu())
 
 
-@router_admin.callback_query(F.data == "admin_stats")
+@router_admin.callback_query(F.data == "admin_stats", IsSuperAdmin())
 async def admin_stats(cb: CallbackQuery):
-    if not is_super_admin(cb.from_user.id):
-        await cb.answer("Нет доступа", show_alert=True)
-        return
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT COUNT(*) FROM users")
         total = (await cur.fetchone())[0]
@@ -551,52 +621,68 @@ async def admin_stats(cb: CallbackQuery):
     await cb.answer()
 
 
-# --- добавление статуса ---
-@router_admin.callback_query(F.data == "admin_set_status")
+@router_admin.callback_query(F.data == "admin_set_status", IsSuperAdmin())
 async def admin_set_status(cb: CallbackQuery, state: FSMContext):
-    if not is_super_admin(cb.from_user.id):
-        await cb.answer("Нет доступа", show_alert=True)
-        return
     await state.update_data(action="set")
     await state.set_state(AdminFSM.waiting_target)
-    await cb.message.answer("Отправь @username или ID пользователя:")
+    await cb.message.answer(
+        "Отправь одно из:\n"
+        "• <code>@username</code>\n"
+        "• <code>123456789</code> (ID)\n"
+        "• <code>@username 123456789</code> (оба сразу)\n\n"
+        "ℹ️ Если у пользователя ещё нет записи в базе — укажи ID, "
+        "тогда она создастся сразу."
+    )
     await cb.answer()
 
 
-@router_admin.message(AdminFSM.waiting_target, F.text)
+@router_admin.message(AdminFSM.waiting_target, F.text, IsSuperAdmin())
 async def admin_target(message: Message, state: FSMContext):
-    if not is_super_admin(message.from_user.id):
-        return
     data = await state.get_data()
     action = data.get("action", "set")
     arg = message.text.strip()
 
     target_id = None
     target_username = None
-    if arg.startswith("@"):
-        target_username = arg[1:]
-    elif arg.lstrip("-").isdigit():
-        target_id = int(arg)
-    else:
-        await message.answer("Некорректно. Отправь @username или ID.")
+    for p in arg.split():
+        if p.startswith("@"):
+            target_username = p[1:]
+        elif p.lstrip("-").isdigit():
+            target_id = int(p)
+
+    if target_id is None and target_username is None:
+        await message.answer(
+            "Не понял. Отправь <code>@username</code>, "
+            "<code>123456789</code> или <code>@username 123456789</code>."
+        )
         return
 
+    # Если дан ID — создаём запись сразу
+    if target_id:
+        existing = await get_user(target_id)
+        if not existing:
+            await upsert_user(target_id, target_username, None)
+
+    # Если дан только username — ищем в базе
     if target_id is None and target_username:
         found = await get_user_by_username(target_username)
         if found:
             target_id = found["user_id"]
+        else:
+            await message.answer(
+                "❗ Пользователя с таким @username нет в базе.\n\n"
+                "Telegram не даёт боту ID по username. Варианты:\n"
+                "• дождись, пока он напишет в группу с ботом "
+                "(сохранится автоматически)\n"
+                "• укажи его ID: <code>@username 123456789</code>"
+            )
+            await state.clear()
+            return
 
     await state.update_data(target_id=target_id,
                             target_username=target_username)
 
     if action == "ban":
-        if target_id is None:
-            await message.answer(
-                "Пользователь не найден в базе. Пусть он запустит бота "
-                "или перешли его сообщение."
-            )
-            await state.clear()
-            return
         await set_status(target_id, STATUS_BANNED, "Глобальный бан",
                          None, username=target_username)
         await log_action(message.from_user.id, "ban_anywhere", target_id)
@@ -605,27 +691,20 @@ async def admin_target(message: Message, state: FSMContext):
         return
 
     if action == "reset":
-        if target_id is None:
-            await message.answer("Не найден.")
-            await state.clear()
-            return
         await set_status(target_id, STATUS_NORMAL, None, None)
         await log_action(message.from_user.id, "reset_status", target_id)
         await message.answer("🔁 Статус сброшен на «Обычный».")
         await state.clear()
         return
 
-    # action == "set"
     await state.set_state(None)
-    await message.answer(f"Выбери статус для <code>{arg}</code>:",
+    label = f"@{target_username}" if target_username else str(target_id)
+    await message.answer(f"Выбери статус для <code>{label}</code>:",
                          reply_markup=status_choice_kb("set"))
 
 
-@router_admin.callback_query(F.data.startswith("set:"))
+@router_admin.callback_query(F.data.startswith("set:"), IsSuperAdmin())
 async def admin_pick_status(cb: CallbackQuery, state: FSMContext):
-    if not is_super_admin(cb.from_user.id):
-        await cb.answer("Нет доступа", show_alert=True)
-        return
     status = cb.data.split(":", 1)[1]
     data = await state.get_data()
     if status in (STATUS_SCAM, STATUS_SUSPICIOUS):
@@ -641,10 +720,8 @@ async def admin_pick_status(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 
-@router_admin.message(AdminFSM.waiting_reason)
+@router_admin.message(AdminFSM.waiting_reason, IsSuperAdmin())
 async def admin_reason(message: Message, state: FSMContext):
-    if not is_super_admin(message.from_user.id):
-        return
     await state.update_data(pending_reason=message.text)
     await state.set_state(AdminFSM.waiting_evidence)
     await message.answer(
@@ -653,10 +730,8 @@ async def admin_reason(message: Message, state: FSMContext):
     )
 
 
-@router_admin.message(AdminFSM.waiting_evidence)
+@router_admin.message(AdminFSM.waiting_evidence, IsSuperAdmin())
 async def admin_evidence(message: Message, state: FSMContext):
-    if not is_super_admin(message.from_user.id):
-        return
     evidence = message.text.strip()
     if evidence == "-":
         evidence = None
@@ -684,35 +759,24 @@ async def _apply_status(target_id, target_username, status,
                      f"reason={reason}; evidence={evidence_url}")
 
 
-# --- бан / сброс ---
-@router_admin.callback_query(F.data == "admin_ban_anywhere")
+@router_admin.callback_query(F.data == "admin_ban_anywhere", IsSuperAdmin())
 async def admin_ban_start(cb: CallbackQuery, state: FSMContext):
-    if not is_super_admin(cb.from_user.id):
-        await cb.answer("Нет доступа", show_alert=True)
-        return
     await state.update_data(action="ban")
     await state.set_state(AdminFSM.waiting_target)
     await cb.message.answer("Отправь @username или ID для глобального бана.")
     await cb.answer()
 
 
-@router_admin.callback_query(F.data == "admin_reset_status")
+@router_admin.callback_query(F.data == "admin_reset_status", IsSuperAdmin())
 async def admin_reset_start(cb: CallbackQuery, state: FSMContext):
-    if not is_super_admin(cb.from_user.id):
-        await cb.answer("Нет доступа", show_alert=True)
-        return
     await state.update_data(action="reset")
     await state.set_state(AdminFSM.waiting_target)
     await cb.message.answer("Кому сбросить статус? Отправь @username или ID.")
     await cb.answer()
 
 
-# --- апелляции ---
-@router_admin.callback_query(F.data.startswith("appeal_change:"))
+@router_admin.callback_query(F.data.startswith("appeal_change:"), IsSuperAdmin())
 async def appeal_change(cb: CallbackQuery, state: FSMContext):
-    if not is_super_admin(cb.from_user.id):
-        await cb.answer("Нет доступа", show_alert=True)
-        return
     appeal_id = int(cb.data.split(":")[1])
     appeal = await get_appeal(appeal_id)
     if not appeal:
@@ -724,11 +788,8 @@ async def appeal_change(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 
-@router_admin.callback_query(F.data.startswith("appeal:"))
+@router_admin.callback_query(F.data.startswith("appeal:"), IsSuperAdmin())
 async def appeal_apply(cb: CallbackQuery, state: FSMContext, bot: Bot):
-    if not is_super_admin(cb.from_user.id):
-        await cb.answer("Нет доступа", show_alert=True)
-        return
     new_status = cb.data.split(":", 1)[1]
     data = await state.get_data()
     appeal_id = data.get("appeal_id")
@@ -751,11 +812,8 @@ async def appeal_apply(cb: CallbackQuery, state: FSMContext, bot: Bot):
     await cb.answer()
 
 
-@router_admin.callback_query(F.data.startswith("appeal_reply:"))
+@router_admin.callback_query(F.data.startswith("appeal_reply:"), IsSuperAdmin())
 async def appeal_reply(cb: CallbackQuery, state: FSMContext):
-    if not is_super_admin(cb.from_user.id):
-        await cb.answer("Нет доступа", show_alert=True)
-        return
     appeal_id = int(cb.data.split(":")[1])
     appeal = await get_appeal(appeal_id)
     if not appeal:
@@ -767,10 +825,8 @@ async def appeal_reply(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 
-@router_admin.message(AdminFSM.waiting_appeal_reply)
+@router_admin.message(AdminFSM.waiting_appeal_reply, IsSuperAdmin())
 async def appeal_reply_send(message: Message, state: FSMContext, bot: Bot):
-    if not is_super_admin(message.from_user.id):
-        return
     data = await state.get_data()
     user_id = data.get("appeal_user")
     appeal_id = data.get("appeal_id")
@@ -785,11 +841,8 @@ async def appeal_reply_send(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
 
 
-@router_admin.callback_query(F.data.startswith("appeal_reject:"))
+@router_admin.callback_query(F.data.startswith("appeal_reject:"), IsSuperAdmin())
 async def appeal_reject(cb: CallbackQuery, state: FSMContext, bot: Bot):
-    if not is_super_admin(cb.from_user.id):
-        await cb.answer("Нет доступа", show_alert=True)
-        return
     appeal_id = int(cb.data.split(":")[1])
     appeal = await get_appeal(appeal_id)
     if not appeal:
@@ -797,8 +850,7 @@ async def appeal_reject(cb: CallbackQuery, state: FSMContext, bot: Bot):
         return
     await set_appeal_status(appeal_id, "rejected")
     try:
-        await bot.send_message(appeal["user_id"],
-                               "❌ Апелляция отклонена.")
+        await bot.send_message(appeal["user_id"], "❌ Апелляция отклонена.")
     except Exception:
         pass
     await cb.message.answer("Апелляция отклонена.")
@@ -814,7 +866,6 @@ async def main():
               default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
 
-    # Порядок: админ → группа → user (catch-all)
     dp.include_router(router_admin)
     dp.include_router(router_group)
     dp.include_router(router_user)
