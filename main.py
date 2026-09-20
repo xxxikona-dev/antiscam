@@ -2,12 +2,14 @@
 import asyncio
 import logging
 import os
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
 
 import aiosqlite
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
+from aiogram.enums import ParseMode, ChatMemberStatus
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import BaseFilter, Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -47,7 +49,7 @@ os.makedirs(TEMPLATES_DIR, exist_ok=True)
 os.makedirs(TEMPLATES_CACHE_DIR, exist_ok=True)
 
 BOT_NAME = "Скам база XkeyO"
-MAX_CAPTION = 1024  # лимит Telegram для caption у фото
+MAX_CAPTION = 1024
 
 # ==========================================================
 # СТАТУСЫ
@@ -124,7 +126,6 @@ def compress_image(src: str, dst: str, max_side: int = 1280, quality: int = 85):
 
 
 def prepare_image(filename: str):
-    """Возвращает путь к сжатой версии картинки или None."""
     src = template_path(filename)
     if not os.path.isfile(src):
         log.warning("Шаблон не найден: %s", src)
@@ -223,6 +224,20 @@ async def init_db():
             key      TEXT PRIMARY KEY,
             file_id  TEXT,
             added_at TEXT
+        )
+        """)
+        # Обязательные группы для чатов
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS required_chats (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id      INTEGER NOT NULL,
+            req_chat_id  INTEGER,
+            req_username TEXT,
+            title        TEXT,
+            link         TEXT,
+            expire_at    TEXT,
+            added_at     TEXT,
+            added_by     INTEGER
         )
         """)
         await db.commit()
@@ -358,6 +373,147 @@ async def delete_cached_file_id(key: str):
 
 
 # ==========================================================
+# БАЗА: ОБЯЗАТЕЛЬНЫЕ ГРУППЫ
+# ==========================================================
+async def add_required_chat(chat_id: int, req_chat_id, req_username, title,
+                            link, expire_at, added_by):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO required_chats
+                (chat_id, req_chat_id, req_username, title, link,
+                 expire_at, added_at, added_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (chat_id, req_chat_id, req_username, title, link,
+              expire_at, datetime.utcnow().isoformat(), added_by))
+        await db.commit()
+
+
+async def list_required_chats(chat_id: int):
+    """Возвращает активные требования (учитывая expire_at)."""
+    now = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("""
+            SELECT * FROM required_chats
+            WHERE chat_id = ? AND (expire_at IS NULL OR expire_at > ?)
+            ORDER BY id ASC
+        """, (chat_id, now))
+        return [dict(r) for r in await cur.fetchall()]
+
+
+async def delete_required_chat(req_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM required_chats WHERE id=?", (req_id,))
+        await db.commit()
+
+
+async def cleanup_expired_required_chats():
+    """Удаляет просроченные требования."""
+    now = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM required_chats WHERE expire_at IS NOT NULL AND expire_at <= ?",
+            (now,))
+        await db.commit()
+
+
+# ==========================================================
+# УТИЛИТЫ ДЛЯ ПРОВЕРКИ ПОДПИСКИ
+# ==========================================================
+def parse_duration(raw: str):
+    """
+    '0' → None (бессрочно)
+    '30m' → 30 минут
+    '1h' → 1 час
+    '1d' → 1 день
+    '5' → 5 часов (по умолчанию часы, если без суффикса)
+    Возвращает datetime UTC или None.
+    """
+    raw = raw.strip().lower()
+    if raw == "0":
+        return None
+
+    m = re.fullmatch(r"(\d+)([mhd]?)", raw)
+    if not m:
+        return None
+    value = int(m.group(1))
+    unit = m.group(2) or "h"
+
+    if unit == "m":
+        delta = timedelta(minutes=value)
+    elif unit == "h":
+        delta = timedelta(hours=value)
+    elif unit == "d":
+        delta = timedelta(days=value)
+    else:
+        return None
+    return datetime.utcnow() + delta
+
+
+def parse_link(raw: str):
+    """
+    Возвращает (username, link) или (None, None), если невалидно.
+    Принимает:
+      @username
+      https://t.me/username
+      t.me/username
+    """
+    raw = raw.strip()
+    if raw.startswith("@"):
+        username = raw[1:]
+        return username, f"https://t.me/{username}"
+
+    m = re.fullmatch(r"(?:https?://)?t\.me/([A-Za-z0-9_]+)/?", raw)
+    if m:
+        username = m.group(1)
+        return username, f"https://t.me/{username}"
+    return None, None
+
+
+async def get_chat_title(bot: Bot, username: str) -> str:
+    """Пытается получить название чата, иначе возвращает @username."""
+    try:
+        chat = await bot.get_chat(f"@{username}")
+        return chat.title or chat.full_name or f"@{username}"
+    except Exception:
+        return f"@{username}"
+
+
+async def is_user_subscribed(bot: Bot, user_id: int, req: dict) -> bool:
+    """Проверяет, подписан ли user_id на чат из требования."""
+    try:
+        member = await bot.get_chat_member(req["req_chat_id"] or f"@{req['req_username']}",
+                                            user_id)
+        return member.status in (
+            ChatMemberStatus.CREATOR,
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.MEMBER,
+            ChatMemberStatus.RESTRICTED,
+        )
+    except TelegramBadRequest as e:
+        # Например, "user not found" — значит не подписан
+        log.info("get_chat_member для %s в %s: %s", user_id, req["req_username"], e)
+        return False
+    except Exception as e:
+        log.warning("Ошибка проверки подписки: %s", e)
+        return False
+
+
+async def check_user_all_subscriptions(bot: Bot, user_id: int,
+                                       chat_id: int):
+    """
+    Возвращает список требований, которым пользователь НЕ соответствует.
+    Если список пуст — можно писать.
+    """
+    reqs = await list_required_chats(chat_id)
+    missing = []
+    for r in reqs:
+        if not await is_user_subscribed(bot, user_id, r):
+            missing.append(r)
+    return missing
+
+
+# ==========================================================
 # УНИВЕРСАЛЬНАЯ ОТПРАВКА КАРТИНОК С КЭШЕМ
 # ==========================================================
 async def send_photo_cached(
@@ -390,26 +546,18 @@ async def send_photo_cached(
             return await bot_or_message.answer(caption, **kwargs)
         return await bot_or_message.send_message(chat_id, caption, **kwargs)
 
-    # 1. Пробуем кэш
     cached_id = await get_cached_file_id(cache_key)
     if cached_id:
         try:
             return await _send_photo(cached_id)
         except Exception as e:
-            log.warning("Кэш %s не сработал (%s) — удаляю и гружу заново",
-                        cache_key, e)
+            log.warning("Кэш %s не сработал (%s) — удаляю", cache_key, e)
             await delete_cached_file_id(cache_key)
 
-    # 2. Готовим файл
     img_full = prepare_image(img_name)
     if img_full is None:
-        log.warning("Файл шаблона отсутствует: %s — отправляю текстом",
-                    img_name)
         return await _send_text()
 
-    log.info("Загружаю новую картинку: %s (из %s)", img_name, img_full)
-
-    # 3. Отправляем и кэшируем
     try:
         msg = await _send_photo(FSInputFile(img_full))
     except Exception as e:
@@ -420,15 +568,13 @@ async def send_photo_cached(
     if msg and getattr(msg, "photo", None):
         try:
             await cache_file_id(cache_key, msg.photo[-1].file_id)
-            log.info("Картинка %s закэширована", img_name)
         except Exception as e:
             log.warning("Не смог закэшировать file_id: %s", e)
-
     return msg
 
 
 # ==========================================================
-# КАРТОЧКА ПОЛЬЗОВАТЕЛЯ
+# КАРТОЧКА
 # ==========================================================
 async def send_status_card(target, user_data: dict, extra_text: str = "",
                            reply_to: Message | None = None):
@@ -453,11 +599,7 @@ async def send_status_card(target, user_data: dict, extra_text: str = "",
         user_data.get("evidence_url"),
         user_data.get("username"),
     )
-
     reply_to_id = reply_to.message_id if reply_to else None
-
-    log.info("send_status_card: статус=%s, img=%s, target=%s",
-             status, img_name, type(target).__name__)
 
     return await send_photo_cached(
         target, None, img_name, text,
@@ -510,6 +652,75 @@ class AutoRegisterMiddleware(BaseMiddleware):
         except Exception as e:
             log.warning("AutoRegister: %s", e)
         return await handler(event, data)
+
+
+# ==========================================================
+# ГЕЙТ: обязательная подписка для сообщений в группе
+# ==========================================================
+class SubscriptionGateMiddleware(BaseMiddleware):
+    """
+    Ловит сообщения в группах. Если чат требует подписку,
+    а пользователь не подписан — удаляет сообщение и просит подписаться.
+    """
+    async def __call__(self, handler, event, data):
+        if not isinstance(event, Message):
+            return await handler(event, data)
+
+        chat = event.chat
+        if chat.type not in ("group", "supergroup"):
+            return await handler(event, data)
+
+        user = event.from_user
+        if not user or user.is_bot:
+            return await handler(event, data)
+
+        # Админ и главный админ — пропускаем
+        if user.id == SUPER_ADMIN_ID:
+            return await handler(event, data)
+        try:
+            member = await event.bot.get_chat_member(chat.id, user.id)
+            if member.status in (ChatMemberStatus.CREATOR,
+                                  ChatMemberStatus.ADMINISTRATOR):
+                return await handler(event, data)
+        except Exception:
+            pass
+
+        # Проверяем требования
+        try:
+            missing = await check_user_all_subscriptions(event.bot, user.id, chat.id)
+        except Exception as e:
+            log.warning("SubscriptionGate: %s", e)
+            return await handler(event, data)
+
+        if not missing:
+            return await handler(event, data)
+
+        # Удаляем сообщение пользователя
+        try:
+            await event.bot.delete_message(chat.id, event.message_id)
+        except Exception as e:
+            log.warning("Не смог удалить сообщение: %s", e)
+
+        # Формируем ответ
+        lines = ["🚫 <b>Чтобы писать в этом чате, нужно подписаться на:</b>\n"]
+        kb_rows = []
+        for r in missing:
+            title = r["title"] or f"@{r['req_username']}"
+            link = r["link"]
+            lines.append(f"• <a href=\"{link}\">{title}</a>")
+            kb_rows.append([InlineKeyboardButton(text=f"📎 {title}", url=link)])
+
+        text = "\n".join(lines) + "\n\n<i>После подписки попробуй снова.</i>"
+        kb = InlineKeyboardMarkup(inline_keyboard=kb_rows) if kb_rows else None
+
+        try:
+            await event.bot.send_message(chat.id, text, reply_markup=kb,
+                                          disable_web_page_preview=True)
+        except Exception as e:
+            log.warning("Не смог отправить требование подписки: %s", e)
+
+        # Не пропускаем дальше
+        return
 
 
 # ==========================================================
@@ -574,6 +785,19 @@ def appeal_admin_kb(appeal_id):
     ])
 
 
+def remgroup_kb(chat_id: int, reqs: list[dict]):
+    """Кнопки удаления требований. chat_id в callback, чтобы отличить."""
+    rows = []
+    for r in reqs:
+        title = r["title"] or f"@{r['req_username']}"
+        # обрезаем длинные названия
+        btn_text = f"🗑 {title}"[:60]
+        rows.append([InlineKeyboardButton(
+            text=btn_text,
+            callback_data=f"remgroup:{chat_id}:{r['id']}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
 # ==========================================================
 # FSM
 # ==========================================================
@@ -595,11 +819,29 @@ router_admin = Router()
 router_group = Router()
 router_user = Router()
 
+# Автосохранение — на всех
 router_user.message.outer_middleware(AutoRegisterMiddleware())
 router_user.callback_query.outer_middleware(AutoRegisterMiddleware())
 router_group.message.outer_middleware(AutoRegisterMiddleware())
 router_group.callback_query.outer_middleware(AutoRegisterMiddleware())
 router_group.chat_member.outer_middleware(AutoRegisterMiddleware())
+
+# Гейт подписки — только на router_group.message
+router_group.message.outer_middleware(SubscriptionGateMiddleware())
+
+
+# ==========================================================
+# ХЕЛПЕР: является ли пользователь админом чата
+# ==========================================================
+async def is_chat_admin(bot: Bot, chat_id: int, user_id: int) -> bool:
+    if user_id == SUPER_ADMIN_ID:
+        return True
+    try:
+        m = await bot.get_chat_member(chat_id, user_id)
+        return m.status in (ChatMemberStatus.CREATOR,
+                             ChatMemberStatus.ADMINISTRATOR)
+    except Exception:
+        return False
 
 
 # ---------------- USER ----------------
@@ -705,6 +947,116 @@ async def appeal_evidence(message: Message, state: FSMContext, bot: Bot):
 
 
 # ---------------- GROUP ----------------
+
+# --- /addgroup <ссылка> <время> ---
+@router_group.message(Command("addgroup"), IsGroupChat())
+async def cmd_addgroup(message: Message, bot: Bot):
+    if not await is_chat_admin(bot, message.chat.id, message.from_user.id):
+        await message.reply("⛔ Только администраторы чата могут использовать эту команду.")
+        return
+
+    parts = (message.text or "").split()
+    if len(parts) < 3:
+        await message.reply(
+            "Использование: <code>/addgroup &lt;ссылка&gt; &lt;время&gt;</code>\n\n"
+            "Примеры:\n"
+            "<code>/addgroup https://t.me/mychannel 1d</code>\n"
+            "<code>/addgroup @mychannel 1h</code>\n"
+            "<code>/addgroup @mychannel 0</code> — бессрочно\n\n"
+            "Время: <code>30m</code>, <code>1h</code>, <code>7d</code>, "
+            "<code>0</code> (бессрочно)."
+        )
+        return
+
+    link_raw = parts[1]
+    time_raw = parts[2]
+
+    username, link = parse_link(link_raw)
+    if not username:
+        await message.reply("❌ Неверная ссылка. Пример: <code>@mychannel</code> "
+                             "или <code>https://t.me/mychannel</code>")
+        return
+
+    expire_at = parse_duration(time_raw)
+    if time_raw != "0" and expire_at is None:
+        await message.reply("❌ Неверное время. Примеры: <code>30m</code>, "
+                             "<code>1h</code>, <code>7d</code>, <code>0</code>.")
+        return
+
+    # Получаем title и реальный chat_id
+    title = await get_chat_title(bot, username)
+    req_chat_id = None
+    try:
+        chat = await bot.get_chat(f"@{username}")
+        req_chat_id = chat.id
+    except Exception as e:
+        await message.reply(
+            f"❌ Не могу получить чат <code>@{username}</code>.\n"
+            f"Убедись, что бот добавлен в этот чат/канал.\n"
+            f"<i>Причина: {e}</i>"
+        )
+        return
+
+    await add_required_chat(
+        chat_id=message.chat.id,
+        req_chat_id=req_chat_id,
+        req_username=username,
+        title=title,
+        link=link,
+        expire_at=expire_at.isoformat() if expire_at else None,
+        added_by=message.from_user.id,
+    )
+    await log_action(message.from_user.id,
+                     "add_required_chat", message.chat.id,
+                     f"req={username}; expire={expire_at}")
+
+    until = "бессрочно" if expire_at is None else expire_at.strftime("%Y-%m-%d %H:%M UTC")
+    await message.reply(
+        f"✅ Добавлено требование подписки:\n"
+        f"• <b>{title}</b> (<a href=\"{link}\">{link}</a>)\n"
+        f"• Действует до: <b>{until}</b>"
+    )
+
+
+# --- /remgroup ---
+@router_group.message(Command("remgroup"), IsGroupChat())
+async def cmd_remgroup(message: Message, bot: Bot):
+    if not await is_chat_admin(bot, message.chat.id, message.from_user.id):
+        await message.reply("⛔ Только администраторы чата могут использовать эту команду.")
+        return
+
+    reqs = await list_required_chats(message.chat.id)
+    if not reqs:
+        await message.reply("ℹ️ В этом чате нет обязательных подписок.")
+        return
+
+    text = ("📋 <b>Обязательные подписки этого чата</b>\n\n"
+            "Нажми на кнопку, чтобы удалить требование:")
+    kb = remgroup_kb(message.chat.id, reqs)
+    await message.reply(text, reply_markup=kb)
+
+
+# --- /listgroup (бонус: посмотреть список без удаления) ---
+@router_group.message(Command("listgroup"), IsGroupChat())
+async def cmd_listgroup(message: Message, bot: Bot):
+    if not await is_chat_admin(bot, message.chat.id, message.from_user.id):
+        await message.reply("⛔ Только администраторы чата могут использовать эту команду.")
+        return
+
+    reqs = await list_required_chats(message.chat.id)
+    if not reqs:
+        await message.reply("ℹ️ В этом чате нет обязательных подписок.")
+        return
+
+    lines = ["📋 <b>Обязательные подписки:</b>\n"]
+    for r in reqs:
+        title = r["title"] or f"@{r['req_username']}"
+        exp = r["expire_at"]
+        until = "бессрочно" if not exp else exp.replace("T", " ")[:16] + " UTC"
+        lines.append(f"• <a href=\"{r['link']}\">{title}</a> — до {until}")
+    await message.reply("\n".join(lines), disable_web_page_preview=True)
+
+
 @router_group.message(Command("check"), IsGroupChat())
 async def cmd_check(message: Message):
     target_id = None
@@ -755,12 +1107,38 @@ async def cmd_check(message: Message):
         await message.reply(text)
 
 
+# --- Callback удаления требования ---
+@router_group.callback_query(F.data.startswith("remgroup:"))
+async def cb_remgroup(cb: CallbackQuery, bot: Bot):
+    try:
+        _, chat_id_str, req_id_str = cb.data.split(":")
+        chat_id = int(chat_id_str)
+        req_id = int(req_id_str)
+    except Exception:
+        await cb.answer("Ошибка данных", show_alert=True)
+        return
+
+    if not await is_chat_admin(bot, chat_id, cb.from_user.id):
+        await cb.answer("Только админ чата может удалять.", show_alert=True)
+        return
+
+    await delete_required_chat(req_id)
+    await log_action(cb.from_user.id, "delete_required_chat", chat_id,
+                     f"req_id={req_id}")
+
+    # Удаляем сообщение с кнопками
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
+    await cb.answer("🗑 Удалено")
+
+
 @router_group.chat_member()
 async def on_chat_member(event: ChatMemberUpdated, bot: Bot):
     new = event.new_chat_member
     old = event.old_chat_member
 
-    # Приветствие нового участника
     if old.status in ("left", "kicked") and new.status in ("member", "administrator"):
         u = new.user
         if u.username:
@@ -779,7 +1157,6 @@ async def on_chat_member(event: ChatMemberUpdated, bot: Bot):
         except Exception as e:
             log.warning("Не смог поприветствовать %s: %s", u.id, e)
 
-    # Кик забаненных
     if new.status in ("member", "restricted"):
         if await is_banned_anywhere(new.user.id):
             try:
@@ -798,7 +1175,9 @@ async def bot_added(event: ChatMemberUpdated, bot: Bot):
             text = (
                 f"👋 Привет! Я <b>{BOT_NAME}</b>.\n\n"
                 f"Проверяйте пользователей командой /check @username "
-                f"или реплаем на сообщение."
+                f"или реплаем на сообщение.\n\n"
+                f"Админ может настроить обязательную подписку: "
+                f"<code>/addgroup &lt;ссылка&gt; &lt;время&gt;</code>"
             )
             await send_photo_cached(bot, event.chat.id, IMAGE_HELLO, text,
                                     cache_prefix="banner")
@@ -807,7 +1186,7 @@ async def bot_added(event: ChatMemberUpdated, bot: Bot):
                         event.chat.id, e)
 
 
-# --- авто-ответ скамеру (последний среди group) ---
+# --- авто-ответ скамеру (последний) ---
 @router_group.message(IsNotSuperAdmin(), IsGroupChat(), F.text | F.caption)
 async def group_autoreply_status(message: Message):
     text = message.text or message.caption or ""
@@ -850,13 +1229,16 @@ async def admin_stats(cb: CallbackQuery):
         appeals = (await cur.fetchone())[0]
         cur = await db.execute("SELECT COUNT(*) FROM chats")
         chats = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT COUNT(*) FROM required_chats")
+        req = (await cur.fetchone())[0]
     await cb.message.answer(
         f"📊 <b>Статистика {BOT_NAME}</b>\n"
         f"Всего записей: {total}\n"
         f"🚨 Скамеров: {scams}\n"
         f"⛔ Забанено везде: {banned}\n"
         f"⚖️ Апелляций: {appeals}\n"
-        f"💬 Чатов с ботом: {chats}"
+        f"💬 Чатов с ботом: {chats}\n"
+        f"🔒 Обязательных подписок: {req}"
     )
     await cb.answer()
 
@@ -870,7 +1252,6 @@ async def admin_set_status(cb: CallbackQuery, state: FSMContext):
         "• <code>@username</code>\n"
         "• <code>123456789</code> (ID)\n"
         "• <code>@username 123456789</code> (оба сразу)\n\n"
-        "ℹ️ Если у пользователя ещё нет записи — укажи ID.\n"
         "⚠️ Статус «Администратор» выдать нельзя."
     )
     await cb.answer()
@@ -909,7 +1290,7 @@ async def admin_target(message: Message, state: FSMContext):
         else:
             await message.answer(
                 "❗ Пользователя с таким @username нет в базе.\n\n"
-                "Telegram не даёт боту ID по username. Варианты:\n"
+                "Варианты:\n"
                 "• дождись, пока он напишет в группу с ботом\n"
                 "• укажи его ID: <code>@username 123456789</code>"
             )
@@ -1097,6 +1478,18 @@ async def appeal_reject(cb: CallbackQuery, state: FSMContext, bot: Bot):
 
 
 # ==========================================================
+# ФОНОВАЯ ЗАДАЧА: чистка просроченных требований
+# ==========================================================
+async def cleaner_task():
+    while True:
+        try:
+            await cleanup_expired_required_chats()
+        except Exception as e:
+            log.warning("cleaner: %s", e)
+        await asyncio.sleep(600)  # раз в 10 минут
+
+
+# ==========================================================
 # ЗАПУСК
 # ==========================================================
 async def main():
@@ -1113,6 +1506,8 @@ async def main():
 
     await bot.delete_webhook(drop_pending_updates=True)
     log.info("%s запущен, админ=%s", BOT_NAME, SUPER_ADMIN_ID)
+
+    asyncio.create_task(cleaner_task())
     await dp.start_polling(bot)
 
 
