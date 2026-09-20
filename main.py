@@ -20,6 +20,12 @@ from aiogram.types import (
     Message,
 )
 
+try:
+    from PIL import Image
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
 # ==========================================================
 # КОНФИГ
 # ==========================================================
@@ -29,6 +35,7 @@ REPORT_GROUP_URL = os.getenv("REPORT_GROUP_URL", "https://t.me/")
 EVIDENCE_GROUP_URL = os.getenv("EVIDENCE_GROUP_URL", REPORT_GROUP_URL)
 DB_PATH = os.getenv("DB_PATH", "data/antiscam.db")
 TEMPLATES_DIR = os.getenv("TEMPLATES_DIR", "templates")
+TEMPLATES_CACHE_DIR = os.path.join(TEMPLATES_DIR, "_cache")
 
 if not BOT_TOKEN:
     raise SystemExit("Не задана переменная окружения BOT_TOKEN")
@@ -37,6 +44,7 @@ if not SUPER_ADMIN_ID:
 
 os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
 os.makedirs(TEMPLATES_DIR, exist_ok=True)
+os.makedirs(TEMPLATES_CACHE_DIR, exist_ok=True)
 
 BOT_NAME = "Скам база XkeyO"
 
@@ -48,7 +56,7 @@ STATUS_SUSPICIOUS = "suspicious"
 STATUS_NORMAL = "normal"
 STATUS_VERIFIED = "verified"
 STATUS_BANNED = "banned"
-STATUS_ADMIN = "admin"          # только для главного админа, выдать нельзя
+STATUS_ADMIN = "admin"
 
 STATUS_LABELS = {
     STATUS_SCAM: "🚨 Скамер",
@@ -59,19 +67,18 @@ STATUS_LABELS = {
     STATUS_ADMIN: "👑 Администратор",
 }
 
-# Картинка для каждого статуса (лежит в templates/)
 STATUS_IMAGES = {
     STATUS_SCAM: "scam.png",
     STATUS_SUSPICIOUS: "sus.png",
     STATUS_NORMAL: "def.png",
     STATUS_VERIFIED: "proof.png",
-    STATUS_BANNED: "scam.png",       # забанен везде — та же картинка, что скамер
+    STATUS_BANNED: "scam.png",
     STATUS_ADMIN: "admin.png",
 }
 
-# Картинки-баннеры для разных случаев
 IMAGE_START = "start.png"
 IMAGE_HELLO = "hello.png"
+IMAGE_NORMAL_FALLBACK = "def.png"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -80,12 +87,52 @@ logging.basicConfig(
 log = logging.getLogger("antiscam")
 
 
+# ==========================================================
+# РАБОТА С КАРТИНКАМИ
+# ==========================================================
 def template_path(filename: str) -> str:
     return os.path.join(TEMPLATES_DIR, filename)
 
 
 def template_exists(filename: str) -> bool:
     return os.path.isfile(template_path(filename))
+
+
+def compressed_template_path(filename: str) -> str:
+    return os.path.join(TEMPLATES_CACHE_DIR, filename)
+
+
+def compress_image(src: str, dst: str, max_side: int = 1280, quality: int = 85):
+    if not HAS_PIL:
+        return src
+    try:
+        img = Image.open(src)
+        img = img.convert("RGB")
+        w, h = img.size
+        if max(w, h) > max_side:
+            if w >= h:
+                new_size = (max_side, int(h * max_side / w))
+            else:
+                new_size = (int(w * max_side / h), max_side)
+            img = img.resize(new_size, Image.LANCZOS)
+        img.save(dst, "JPEG", quality=quality, optimize=True)
+        return dst
+    except Exception as e:
+        log.warning("Не смог сжать %s: %s", src, e)
+        return src
+
+
+def prepare_image(filename: str) -> str | None:
+    """Возвращает путь к сжатой версии картинки или None."""
+    src = template_path(filename)
+    if not os.path.isfile(src):
+        log.warning("Шаблон не найден: %s", src)
+        return None
+    dst = compressed_template_path(filename)
+    if (not os.path.isfile(dst)
+            or os.path.getmtime(src) > os.path.getmtime(dst)):
+        return compress_image(src, dst)
+    return dst
 
 
 # ==========================================================
@@ -101,6 +148,22 @@ class IsNotSuperAdmin(BaseFilter):
     async def __call__(self, event) -> bool:
         user = getattr(event, "from_user", None)
         return bool(user and user.id != SUPER_ADMIN_ID)
+
+
+class IsPrivateChat(BaseFilter):
+    async def __call__(self, event) -> bool:
+        chat = getattr(event, "chat", None)
+        if chat is None and hasattr(event, "message"):
+            chat = event.message.chat
+        return bool(chat and chat.type == "private")
+
+
+class IsGroupChat(BaseFilter):
+    async def __call__(self, event) -> bool:
+        chat = getattr(event, "chat", None)
+        if chat is None and hasattr(event, "message"):
+            chat = event.message.chat
+        return bool(chat and chat.type in ("group", "supergroup"))
 
 
 # ==========================================================
@@ -148,18 +211,19 @@ async def init_db():
             added_at  TEXT
         )
         """)
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS media_cache (
+            key      TEXT PRIMARY KEY,
+            file_id  TEXT,
+            added_at TEXT
+        )
+        """)
         await db.commit()
     log.info("База данных готова: %s", DB_PATH)
 
 
 async def upsert_user(user_id, username=None, full_name=None):
-    """Автосохранение. НЕ перетирает статус, только обновляет username/имя."""
-    # Админ всегда имеет статус admin
-    if user_id == SUPER_ADMIN_ID:
-        status = STATUS_ADMIN
-    else:
-        status = STATUS_NORMAL
-
+    status = STATUS_ADMIN if user_id == SUPER_ADMIN_ID else STATUS_NORMAL
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             INSERT INTO users (user_id, username, full_name, status, updated_at)
@@ -194,7 +258,6 @@ async def get_user_by_username(username):
 
 async def set_status(user_id, status, reason=None, evidence_url=None,
                      username=None, full_name=None):
-    # Защита: статус admin нельзя присвоить никому, кроме самого админа
     if status == STATUS_ADMIN and user_id != SUPER_ADMIN_ID:
         return
     async with aiosqlite.connect(DB_PATH) as db:
@@ -263,21 +326,88 @@ async def register_chat(chat_id, title):
         await db.commit()
 
 
+async def get_cached_file_id(key: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT file_id FROM media_cache WHERE key=?", (key,))
+        row = await cur.fetchone()
+        return row[0] if row else None
+
+
+async def cache_file_id(key: str, file_id: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO media_cache (key, file_id, added_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET file_id=excluded.file_id
+        """, (key, file_id, datetime.utcnow().isoformat()))
+        await db.commit()
+
+
 # ==========================================================
-# ОТПРАВКА КАРТОЧКИ С КАРТИНКОЙ
+# УНИВЕРСАЛЬНАЯ ОТПРАВКА КАРТИНОК С КЭШЕМ
+# ==========================================================
+async def send_photo_cached(
+    bot_or_message,
+    chat_id: int | None,
+    img_name: str,
+    caption: str,
+    reply_markup=None,
+    reply_to_message_id: int | None = None,
+    cache_prefix: str = "img",
+):
+    """
+    bot_or_message — либо Message (отвечаем в тот же чат),
+                     либо Bot (шлём в chat_id).
+    Возвращает отправленное сообщение.
+    """
+    cache_key = f"{cache_prefix}:{img_name}"
+    cached_id = await get_cached_file_id(cache_key)
+
+    kwargs = {}
+    if reply_markup is not None:
+        kwargs["reply_markup"] = reply_markup
+    if reply_to_message_id is not None:
+        kwargs["reply_to_message_id"] = reply_to_message_id
+
+    async def _send_photo(file_or_id):
+        if isinstance(bot_or_message, Message):
+            return await bot_or_message.answer_photo(
+                file_or_id, caption=caption, **kwargs)
+        return await bot_or_message.send_photo(
+            chat_id, file_or_id, caption=caption, **kwargs)
+
+    async def _send_text():
+        if isinstance(bot_or_message, Message):
+            return await bot_or_message.answer(caption, **kwargs)
+        return await bot_or_message.send_message(chat_id, caption, **kwargs)
+
+    if cached_id:
+        try:
+            return await _send_photo(cached_id)
+        except Exception as e:
+            log.warning("Кэш %s устарел (%s), перезагружаю", cache_key, e)
+
+    img_full = prepare_image(img_name)
+    if img_full:
+        msg = await _send_photo(FSInputFile(img_full))
+        if msg and getattr(msg, "photo", None):
+            await cache_file_id(cache_key, msg.photo[-1].file_id)
+        return msg
+    return await _send_text()
+
+
+# ==========================================================
+# КАРТОЧКА ПОЛЬЗОВАТЕЛЯ
 # ==========================================================
 async def send_status_card(target, user_data: dict, extra_text: str = "",
                            reply_to: Message | None = None):
     """
-    target — Message или CallbackQuery.message (куда отправлять)
-    user_data — словарь из базы
-    extra_text — доп. строка (например, «Причина: ...»)
-    reply_to — если задано, будет reply на это сообщение (для группового ответа)
+    target — Message или объект с .answer_photo / .answer
     """
     status = user_data.get("status", STATUS_NORMAL)
     label = STATUS_LABELS.get(status, status)
     img_name = STATUS_IMAGES.get(status, IMAGE_NORMAL_FALLBACK)
-    img_full = template_path(img_name)
 
     text = (
         f"📇 <b>Карточка</b>\n"
@@ -297,24 +427,19 @@ async def send_status_card(target, user_data: dict, extra_text: str = "",
         user_data.get("username"),
     )
 
-    if template_exists(img_name):
-        photo = FSInputFile(img_full)
-        return await target.answer_photo(
-            photo, caption=text, reply_markup=kb,
-            reply_to_message_id=reply_to.message_id if reply_to else None,
-        )
-    else:
-        return await target.answer(
-            text, reply_markup=kb,
-            reply_to_message_id=reply_to.message_id if reply_to else None,
-        )
+    reply_to_id = reply_to.message_id if reply_to else None
 
-
-IMAGE_NORMAL_FALLBACK = "def.png"
+    # target может быть Message или CallbackQuery.message — оба умеют answer_photo
+    return await send_photo_cached(
+        target, None, img_name, text,
+        reply_markup=kb,
+        reply_to_message_id=reply_to_id,
+        cache_prefix="status",
+    )
 
 
 # ==========================================================
-# АВТО-СОХРАНЕНИЕ ЛЮБОГО УПОМЯНУТОГО ПОЛЬЗОВАТЕЛЯ
+# АВТО-СОХРАНЕНИЕ
 # ==========================================================
 async def auto_save_from_message(message: Message):
     saved = set()
@@ -327,18 +452,14 @@ async def auto_save_from_message(message: Message):
 
     if message.from_user:
         await save(message.from_user)
-
     if message.reply_to_message and message.reply_to_message.from_user:
         await save(message.reply_to_message.from_user)
-
     if message.forward_from:
         await save(message.forward_from)
-
     if message.entities:
         for ent in message.entities:
             if ent.type == "text_mention" and ent.user:
                 await save(ent.user)
-
     if message.caption_entities:
         for ent in message.caption_entities:
             if ent.type == "text_mention" and ent.user:
@@ -453,7 +574,7 @@ router_group.chat_member.outer_middleware(AutoRegisterMiddleware())
 
 
 # ---------------- USER ----------------
-@router_user.message(CommandStart(), IsNotSuperAdmin())
+@router_user.message(CommandStart(), IsNotSuperAdmin(), IsPrivateChat())
 async def user_start(message: Message, state: FSMContext):
     await state.clear()
     text = (
@@ -461,21 +582,15 @@ async def user_start(message: Message, state: FSMContext):
         "Помогаю собирать информацию о скамерах и проверять пользователей.\n"
         "Выбери действие:"
     )
-    if template_exists(IMAGE_START):
-        await message.answer_photo(
-            FSInputFile(template_path(IMAGE_START)),
-            caption=text,
-            reply_markup=user_menu(),
-        )
-    else:
-        await message.answer(text, reply_markup=user_menu())
+    await send_photo_cached(message, None, IMAGE_START, text,
+                            reply_markup=user_menu(),
+                            cache_prefix="banner")
 
 
-@router_user.callback_query(F.data == "check_me")
+@router_user.callback_query(F.data == "check_me", IsPrivateChat())
 async def check_me(cb: CallbackQuery):
     u = await get_user(cb.from_user.id)
     if not u:
-        # На всякий случай, если по какой-то причине нет в базе
         await upsert_user(cb.from_user.id, cb.from_user.username,
                           cb.from_user.full_name)
         u = await get_user(cb.from_user.id)
@@ -483,7 +598,7 @@ async def check_me(cb: CallbackQuery):
     await cb.answer()
 
 
-@router_user.callback_query(F.data == "check_user_hint")
+@router_user.callback_query(F.data == "check_user_hint", IsPrivateChat())
 async def check_user_hint(cb: CallbackQuery):
     await cb.message.answer(
         "Чтобы проверить пользователя:\n"
@@ -494,7 +609,7 @@ async def check_user_hint(cb: CallbackQuery):
     await cb.answer()
 
 
-@router_user.message(F.forward_from)
+@router_user.message(F.forward_from, IsPrivateChat())
 async def check_forward(message: Message):
     t = message.forward_from
     u = await get_user(t.id)
@@ -504,7 +619,7 @@ async def check_forward(message: Message):
     await send_status_card(message, u)
 
 
-@router_user.message(F.forward_from_chat)
+@router_user.message(F.forward_from_chat, IsPrivateChat())
 async def check_forward_chat(message: Message):
     c = message.forward_from_chat
     u = await get_user(c.id) or {
@@ -515,7 +630,7 @@ async def check_forward_chat(message: Message):
     await send_status_card(message, u)
 
 
-@router_user.callback_query(F.data == "appeal_start")
+@router_user.callback_query(F.data == "appeal_start", IsPrivateChat())
 async def appeal_start(cb: CallbackQuery, state: FSMContext):
     await state.set_state(AppealFSM.waiting_evidence)
     await cb.message.answer(
@@ -526,7 +641,7 @@ async def appeal_start(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 
-@router_user.message(AppealFSM.waiting_evidence)
+@router_user.message(AppealFSM.waiting_evidence, IsPrivateChat())
 async def appeal_evidence(message: Message, state: FSMContext, bot: Bot):
     photo_id = message.photo[-1].file_id if message.photo else None
     video_id = message.video.file_id if message.video else None
@@ -561,7 +676,7 @@ async def appeal_evidence(message: Message, state: FSMContext, bot: Bot):
 
 
 # ---------------- GROUP ----------------
-@router_group.message(Command("check"))
+@router_group.message(Command("check"), IsGroupChat())
 async def cmd_check(message: Message):
     target_id = None
     target_username = None
@@ -611,21 +726,6 @@ async def cmd_check(message: Message):
         await message.reply(text)
 
 
-# --- Авто-ответ статусом на сообщения скамеров ---
-@router_group.message(IsNotSuperAdmin(), F.text | F.caption)
-async def group_autoreply_status(message: Message):
-    # Не реагируем на команды
-    if message.text and message.text.startswith("/"):
-        return
-    u = await get_user(message.from_user.id)
-    if not u:
-        return
-    status = u.get("status")
-    if status in (STATUS_SCAM, STATUS_BANNED):
-        # Отвечаем реплаем на его сообщение карточкой
-        await send_status_card(message, u, reply_to=message)
-
-
 @router_group.chat_member()
 async def on_chat_member(event: ChatMemberUpdated, bot: Bot):
     new = event.new_chat_member
@@ -634,22 +734,23 @@ async def on_chat_member(event: ChatMemberUpdated, bot: Bot):
     # Приветствие нового участника
     if old.status in ("left", "kicked") and new.status in ("member", "administrator"):
         u = new.user
+        if u.username:
+            mention = f"@{u.username}"
+        else:
+            mention = f'<a href="tg://user?id={u.id}">{u.full_name}</a>'
+
         text = (
-            f"👋 Добро пожаловать, {u.full_name}!\n\n"
+            f"👋 Добро пожаловать, {mention}!\n\n"
             f"Это <b>{BOT_NAME}</b>. Здесь собирается информация о скамерах. "
-            f"Будь внимателен и проверяй пользователей через /check."
+            f"Проверяй пользователей через /check."
         )
         try:
-            if template_exists(IMAGE_HELLO):
-                await bot.send_photo(event.chat.id,
-                                     FSImage := FSInputFile(template_path(IMAGE_HELLO)),
-                                     caption=text)
-            else:
-                await bot.send_message(event.chat.id, text)
+            await send_photo_cached(bot, event.chat.id, IMAGE_HELLO, text,
+                                    cache_prefix="banner")
         except Exception as e:
             log.warning("Не смог поприветствовать %s: %s", u.id, e)
 
-    # Кик забаненных везде
+    # Кик забаненных
     if new.status in ("member", "restricted"):
         if await is_banned_anywhere(new.user.id):
             try:
@@ -664,43 +765,48 @@ async def bot_added(event: ChatMemberUpdated, bot: Bot):
     if event.new_chat_member.status in ("member", "administrator"):
         await register_chat(event.chat.id,
                             event.chat.title or str(event.chat.id))
-        # Представимся при добавлении в группу
         try:
             text = (
                 f"👋 Привет! Я <b>{BOT_NAME}</b>.\n\n"
                 f"Проверяйте пользователей командой /check @username "
                 f"или реплаем на сообщение."
             )
-            if template_exists(IMAGE_HELLO):
-                await bot.send_photo(event.chat.id,
-                                     FSInputFile(template_path(IMAGE_HELLO)),
-                                     caption=text)
-            else:
-                await bot.send_message(event.chat.id, text)
+            await send_photo_cached(bot, event.chat.id, IMAGE_HELLO, text,
+                                    cache_prefix="banner")
         except Exception as e:
             log.warning("Не смог представиться в чате %s: %s",
                         event.chat.id, e)
 
 
+# --- авто-ответ скамеру (последний среди group) ---
+@router_group.message(IsNotSuperAdmin(), IsGroupChat(), F.text | F.caption)
+async def group_autoreply_status(message: Message):
+    text = message.text or message.caption or ""
+    if text.startswith("/"):
+        return
+    u = await get_user(message.from_user.id)
+    if not u:
+        return
+    if u.get("status") in (STATUS_SCAM, STATUS_BANNED):
+        await send_status_card(message, u, reply_to=message)
+
+
 # ---------------- ADMIN ----------------
-@router_admin.message(CommandStart(), IsSuperAdmin())
+@router_admin.message(CommandStart(), IsSuperAdmin(), IsPrivateChat())
 async def admin_start(message: Message, state: FSMContext):
     await state.clear()
     text = f"🛠 <b>{BOT_NAME}</b> — админ-панель"
-    if template_exists(IMAGE_START):
-        await message.answer_photo(FSInputFile(template_path(IMAGE_START)),
-                                   caption=text,
-                                   reply_markup=admin_menu())
-    else:
-        await message.answer(text, reply_markup=admin_menu())
+    await send_photo_cached(message, None, IMAGE_START, text,
+                            reply_markup=admin_menu(),
+                            cache_prefix="banner")
 
 
-@router_admin.message(Command("admin"), IsSuperAdmin())
+@router_admin.message(Command("admin"), IsSuperAdmin(), IsPrivateChat())
 async def admin_cmd(message: Message):
     await message.answer("🛠 Админ-панель", reply_markup=admin_menu())
 
 
-@router_admin.callback_query(F.data == "admin_stats", IsSuperAdmin())
+@router_admin.callback_query(F.data == "admin_stats", IsSuperAdmin(), IsPrivateChat())
 async def admin_stats(cb: CallbackQuery):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT COUNT(*) FROM users")
@@ -726,7 +832,7 @@ async def admin_stats(cb: CallbackQuery):
     await cb.answer()
 
 
-@router_admin.callback_query(F.data == "admin_set_status", IsSuperAdmin())
+@router_admin.callback_query(F.data == "admin_set_status", IsSuperAdmin(), IsPrivateChat())
 async def admin_set_status(cb: CallbackQuery, state: FSMContext):
     await state.update_data(action="set")
     await state.set_state(AdminFSM.waiting_target)
@@ -735,14 +841,13 @@ async def admin_set_status(cb: CallbackQuery, state: FSMContext):
         "• <code>@username</code>\n"
         "• <code>123456789</code> (ID)\n"
         "• <code>@username 123456789</code> (оба сразу)\n\n"
-        "ℹ️ Если у пользователя ещё нет записи — укажи ID, "
-        "запись создастся сразу.\n"
-        "⚠️ Статус «Администратор» выдать нельзя — он только у тебя."
+        "ℹ️ Если у пользователя ещё нет записи — укажи ID.\n"
+        "⚠️ Статус «Администратор» выдать нельзя."
     )
     await cb.answer()
 
 
-@router_admin.message(AdminFSM.waiting_target, F.text, IsSuperAdmin())
+@router_admin.message(AdminFSM.waiting_target, F.text, IsSuperAdmin(), IsPrivateChat())
 async def admin_target(message: Message, state: FSMContext):
     data = await state.get_data()
     action = data.get("action", "set")
@@ -806,7 +911,7 @@ async def admin_target(message: Message, state: FSMContext):
                          reply_markup=status_choice_kb("set"))
 
 
-@router_admin.callback_query(F.data.startswith("set:"), IsSuperAdmin())
+@router_admin.callback_query(F.data.startswith("set:"), IsSuperAdmin(), IsPrivateChat())
 async def admin_pick_status(cb: CallbackQuery, state: FSMContext):
     status = cb.data.split(":", 1)[1]
     data = await state.get_data()
@@ -823,7 +928,7 @@ async def admin_pick_status(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 
-@router_admin.message(AdminFSM.waiting_reason, IsSuperAdmin())
+@router_admin.message(AdminFSM.waiting_reason, IsSuperAdmin(), IsPrivateChat())
 async def admin_reason(message: Message, state: FSMContext):
     await state.update_data(pending_reason=message.text)
     await state.set_state(AdminFSM.waiting_evidence)
@@ -833,7 +938,7 @@ async def admin_reason(message: Message, state: FSMContext):
     )
 
 
-@router_admin.message(AdminFSM.waiting_evidence, IsSuperAdmin())
+@router_admin.message(AdminFSM.waiting_evidence, IsSuperAdmin(), IsPrivateChat())
 async def admin_evidence(message: Message, state: FSMContext):
     evidence = message.text.strip()
     if evidence == "-":
@@ -864,7 +969,7 @@ async def _apply_status(target_id, target_username, status,
                      f"reason={reason}; evidence={evidence_url}")
 
 
-@router_admin.callback_query(F.data == "admin_ban_anywhere", IsSuperAdmin())
+@router_admin.callback_query(F.data == "admin_ban_anywhere", IsSuperAdmin(), IsPrivateChat())
 async def admin_ban_start(cb: CallbackQuery, state: FSMContext):
     await state.update_data(action="ban")
     await state.set_state(AdminFSM.waiting_target)
@@ -872,7 +977,7 @@ async def admin_ban_start(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 
-@router_admin.callback_query(F.data == "admin_reset_status", IsSuperAdmin())
+@router_admin.callback_query(F.data == "admin_reset_status", IsSuperAdmin(), IsPrivateChat())
 async def admin_reset_start(cb: CallbackQuery, state: FSMContext):
     await state.update_data(action="reset")
     await state.set_state(AdminFSM.waiting_target)
@@ -880,7 +985,7 @@ async def admin_reset_start(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 
-@router_admin.callback_query(F.data.startswith("appeal_change:"), IsSuperAdmin())
+@router_admin.callback_query(F.data.startswith("appeal_change:"), IsSuperAdmin(), IsPrivateChat())
 async def appeal_change(cb: CallbackQuery, state: FSMContext):
     appeal_id = int(cb.data.split(":")[1])
     appeal = await get_appeal(appeal_id)
@@ -893,7 +998,7 @@ async def appeal_change(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 
-@router_admin.callback_query(F.data.startswith("appeal:"), IsSuperAdmin())
+@router_admin.callback_query(F.data.startswith("appeal:"), IsSuperAdmin(), IsPrivateChat())
 async def appeal_apply(cb: CallbackQuery, state: FSMContext, bot: Bot):
     new_status = cb.data.split(":", 1)[1]
     data = await state.get_data()
@@ -917,7 +1022,7 @@ async def appeal_apply(cb: CallbackQuery, state: FSMContext, bot: Bot):
     await cb.answer()
 
 
-@router_admin.callback_query(F.data.startswith("appeal_reply:"), IsSuperAdmin())
+@router_admin.callback_query(F.data.startswith("appeal_reply:"), IsSuperAdmin(), IsPrivateChat())
 async def appeal_reply(cb: CallbackQuery, state: FSMContext):
     appeal_id = int(cb.data.split(":")[1])
     appeal = await get_appeal(appeal_id)
@@ -930,7 +1035,7 @@ async def appeal_reply(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 
-@router_admin.message(AdminFSM.waiting_appeal_reply, IsSuperAdmin())
+@router_admin.message(AdminFSM.waiting_appeal_reply, IsSuperAdmin(), IsPrivateChat())
 async def appeal_reply_send(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
     user_id = data.get("appeal_user")
@@ -946,7 +1051,7 @@ async def appeal_reply_send(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
 
 
-@router_admin.callback_query(F.data.startswith("appeal_reject:"), IsSuperAdmin())
+@router_admin.callback_query(F.data.startswith("appeal_reject:"), IsSuperAdmin(), IsPrivateChat())
 async def appeal_reject(cb: CallbackQuery, state: FSMContext, bot: Bot):
     appeal_id = int(cb.data.split(":")[1])
     appeal = await get_appeal(appeal_id)
@@ -971,7 +1076,6 @@ async def main():
               default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
 
-    # Гарантируем, что админ есть в базе со статусом admin
     await upsert_user(SUPER_ADMIN_ID)
 
     dp.include_router(router_admin)
