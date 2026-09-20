@@ -3,7 +3,6 @@ import asyncio
 import logging
 import os
 from datetime import datetime
-from typing import Any, Awaitable, Callable, Dict
 
 import aiosqlite
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
@@ -15,6 +14,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
     ChatMemberUpdated,
+    FSInputFile,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     Message,
@@ -28,6 +28,7 @@ SUPER_ADMIN_ID = int(os.getenv("SUPER_ADMIN_ID", "0"))
 REPORT_GROUP_URL = os.getenv("REPORT_GROUP_URL", "https://t.me/")
 EVIDENCE_GROUP_URL = os.getenv("EVIDENCE_GROUP_URL", REPORT_GROUP_URL)
 DB_PATH = os.getenv("DB_PATH", "data/antiscam.db")
+TEMPLATES_DIR = os.getenv("TEMPLATES_DIR", "templates")
 
 if not BOT_TOKEN:
     raise SystemExit("Не задана переменная окружения BOT_TOKEN")
@@ -35,6 +36,9 @@ if not SUPER_ADMIN_ID:
     raise SystemExit("Не задана переменная окружения SUPER_ADMIN_ID")
 
 os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+os.makedirs(TEMPLATES_DIR, exist_ok=True)
+
+BOT_NAME = "Скам база XkeyO"
 
 # ==========================================================
 # СТАТУСЫ
@@ -44,6 +48,7 @@ STATUS_SUSPICIOUS = "suspicious"
 STATUS_NORMAL = "normal"
 STATUS_VERIFIED = "verified"
 STATUS_BANNED = "banned"
+STATUS_ADMIN = "admin"          # только для главного админа, выдать нельзя
 
 STATUS_LABELS = {
     STATUS_SCAM: "🚨 Скамер",
@@ -51,13 +56,36 @@ STATUS_LABELS = {
     STATUS_NORMAL: "✅ Обычный",
     STATUS_VERIFIED: "🛡 Проверенный",
     STATUS_BANNED: "⛔ Забанен везде",
+    STATUS_ADMIN: "👑 Администратор",
 }
+
+# Картинка для каждого статуса (лежит в templates/)
+STATUS_IMAGES = {
+    STATUS_SCAM: "scam.png",
+    STATUS_SUSPICIOUS: "sus.png",
+    STATUS_NORMAL: "def.png",
+    STATUS_VERIFIED: "proof.png",
+    STATUS_BANNED: "scam.png",       # забанен везде — та же картинка, что скамер
+    STATUS_ADMIN: "admin.png",
+}
+
+# Картинки-баннеры для разных случаев
+IMAGE_START = "start.png"
+IMAGE_HELLO = "hello.png"
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 log = logging.getLogger("antiscam")
+
+
+def template_path(filename: str) -> str:
+    return os.path.join(TEMPLATES_DIR, filename)
+
+
+def template_exists(filename: str) -> bool:
+    return os.path.isfile(template_path(filename))
 
 
 # ==========================================================
@@ -126,6 +154,12 @@ async def init_db():
 
 async def upsert_user(user_id, username=None, full_name=None):
     """Автосохранение. НЕ перетирает статус, только обновляет username/имя."""
+    # Админ всегда имеет статус admin
+    if user_id == SUPER_ADMIN_ID:
+        status = STATUS_ADMIN
+    else:
+        status = STATUS_NORMAL
+
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             INSERT INTO users (user_id, username, full_name, status, updated_at)
@@ -133,8 +167,10 @@ async def upsert_user(user_id, username=None, full_name=None):
             ON CONFLICT(user_id) DO UPDATE SET
                 username=COALESCE(excluded.username, users.username),
                 full_name=COALESCE(excluded.full_name, users.full_name),
+                status=CASE WHEN excluded.status='admin' THEN 'admin'
+                            ELSE users.status END,
                 updated_at=excluded.updated_at
-        """, (user_id, username, full_name, STATUS_NORMAL,
+        """, (user_id, username, full_name, status,
               datetime.utcnow().isoformat()))
         await db.commit()
 
@@ -158,6 +194,9 @@ async def get_user_by_username(username):
 
 async def set_status(user_id, status, reason=None, evidence_url=None,
                      username=None, full_name=None):
+    # Защита: статус admin нельзя присвоить никому, кроме самого админа
+    if status == STATUS_ADMIN and user_id != SUPER_ADMIN_ID:
+        return
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             INSERT INTO users (user_id, username, full_name, status,
@@ -225,16 +264,59 @@ async def register_chat(chat_id, title):
 
 
 # ==========================================================
+# ОТПРАВКА КАРТОЧКИ С КАРТИНКОЙ
+# ==========================================================
+async def send_status_card(target, user_data: dict, extra_text: str = "",
+                           reply_to: Message | None = None):
+    """
+    target — Message или CallbackQuery.message (куда отправлять)
+    user_data — словарь из базы
+    extra_text — доп. строка (например, «Причина: ...»)
+    reply_to — если задано, будет reply на это сообщение (для группового ответа)
+    """
+    status = user_data.get("status", STATUS_NORMAL)
+    label = STATUS_LABELS.get(status, status)
+    img_name = STATUS_IMAGES.get(status, IMAGE_NORMAL_FALLBACK)
+    img_full = template_path(img_name)
+
+    text = (
+        f"📇 <b>Карточка</b>\n"
+        f"ID: <code>{user_data.get('user_id', '—')}</code>\n"
+        f"Имя: {user_data.get('full_name') or '—'}\n"
+        f"Юзернейм: @{user_data.get('username') or '—'}\n"
+        f"Статус: {label}\n"
+    )
+    if user_data.get("reason"):
+        text += f"Причина: {user_data['reason']}\n"
+    if extra_text:
+        text += f"\n{extra_text}"
+
+    kb = profile_kb(
+        user_data.get("user_id") or 0,
+        user_data.get("evidence_url"),
+        user_data.get("username"),
+    )
+
+    if template_exists(img_name):
+        photo = FSInputFile(img_full)
+        return await target.answer_photo(
+            photo, caption=text, reply_markup=kb,
+            reply_to_message_id=reply_to.message_id if reply_to else None,
+        )
+    else:
+        return await target.answer(
+            text, reply_markup=kb,
+            reply_to_message_id=reply_to.message_id if reply_to else None,
+        )
+
+
+IMAGE_NORMAL_FALLBACK = "def.png"
+
+
+# ==========================================================
 # АВТО-СОХРАНЕНИЕ ЛЮБОГО УПОМЯНУТОГО ПОЛЬЗОВАТЕЛЯ
 # ==========================================================
 async def auto_save_from_message(message: Message):
-    """
-    Сохраняет всех, о ком есть инфа в сообщении:
-    - автора
-    - того, кому отвечают (reply)
-    - пересланного (forward)
-    - упомянутых через entities (text_mention)
-    """
     saved = set()
 
     async def save(u):
@@ -264,10 +346,6 @@ async def auto_save_from_message(message: Message):
 
 
 class AutoRegisterMiddleware(BaseMiddleware):
-    """
-    Срабатывает на КАЖДОЕ сообщение/колбэк/чат-событие.
-    Автоматически сохраняет всех, кого видит.
-    """
     async def __call__(self, handler, event, data):
         try:
             if isinstance(event, Message):
@@ -367,7 +445,6 @@ router_admin = Router()
 router_group = Router()
 router_user = Router()
 
-# Автосохранение на всех роутерах
 router_user.message.outer_middleware(AutoRegisterMiddleware())
 router_user.callback_query.outer_middleware(AutoRegisterMiddleware())
 router_group.message.outer_middleware(AutoRegisterMiddleware())
@@ -379,33 +456,30 @@ router_group.chat_member.outer_middleware(AutoRegisterMiddleware())
 @router_user.message(CommandStart(), IsNotSuperAdmin())
 async def user_start(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer(
-        "👋 Привет! Я антискам-бот.\n\n"
+    text = (
+        f"👋 Привет! Это <b>{BOT_NAME}</b>.\n\n"
         "Помогаю собирать информацию о скамерах и проверять пользователей.\n"
-        "Выбери действие:",
-        reply_markup=user_menu()
+        "Выбери действие:"
     )
+    if template_exists(IMAGE_START):
+        await message.answer_photo(
+            FSInputFile(template_path(IMAGE_START)),
+            caption=text,
+            reply_markup=user_menu(),
+        )
+    else:
+        await message.answer(text, reply_markup=user_menu())
 
 
 @router_user.callback_query(F.data == "check_me")
 async def check_me(cb: CallbackQuery):
     u = await get_user(cb.from_user.id)
-    status = u["status"] if u else STATUS_NORMAL
-    text = (
-        f"🔎 <b>Твоя карточка</b>\n"
-        f"ID: <code>{cb.from_user.id}</code>\n"
-        f"Имя: {cb.from_user.full_name}\n"
-        f"Юзернейм: @{cb.from_user.username or '—'}\n"
-        f"Статус: {STATUS_LABELS.get(status, status)}\n"
-    )
-    if u and u.get("reason"):
-        text += f"Причина: {u['reason']}\n"
-    await cb.message.answer(
-        text,
-        reply_markup=profile_kb(cb.from_user.id,
-                                u.get("evidence_url") if u else None,
-                                cb.from_user.username)
-    )
+    if not u:
+        # На всякий случай, если по какой-то причине нет в базе
+        await upsert_user(cb.from_user.id, cb.from_user.username,
+                          cb.from_user.full_name)
+        u = await get_user(cb.from_user.id)
+    await send_status_card(cb.message, u)
     await cb.answer()
 
 
@@ -423,33 +497,22 @@ async def check_user_hint(cb: CallbackQuery):
 @router_user.message(F.forward_from)
 async def check_forward(message: Message):
     t = message.forward_from
-    await _send_profile(message, t.id, t.username, t.full_name)
+    u = await get_user(t.id)
+    if not u:
+        await upsert_user(t.id, t.username, t.full_name)
+        u = await get_user(t.id)
+    await send_status_card(message, u)
 
 
 @router_user.message(F.forward_from_chat)
 async def check_forward_chat(message: Message):
     c = message.forward_from_chat
-    await _send_profile(message, c.id, c.username, c.title)
-
-
-async def _send_profile(message: Message, user_id, username, full_name):
-    u = await get_user(user_id)
-    status = u["status"] if u else STATUS_NORMAL
-    text = (
-        f"📇 <b>Карточка</b>\n"
-        f"ID: <code>{user_id}</code>\n"
-        f"Имя: {full_name or '—'}\n"
-        f"Юзернейм: @{username or '—'}\n"
-        f"Статус: {STATUS_LABELS.get(status, status)}\n"
-    )
-    if u and u.get("reason"):
-        text += f"Причина: {u['reason']}\n"
-    await message.answer(
-        text,
-        reply_markup=profile_kb(user_id,
-                                u.get("evidence_url") if u else None,
-                                username)
-    )
+    u = await get_user(c.id) or {
+        "user_id": c.id, "username": c.username,
+        "full_name": c.title, "status": STATUS_NORMAL,
+        "reason": None, "evidence_url": None,
+    }
+    await send_status_card(message, u)
 
 
 @router_user.callback_query(F.data == "appeal_start")
@@ -530,44 +593,63 @@ async def cmd_check(message: Message):
     if not user and target_username:
         user = await get_user_by_username(target_username)
 
-    # Если нашли по username — берём реальный ID из базы
     if user:
         target_id = user["user_id"]
         target_username = user.get("username") or target_username
         target_name = user.get("full_name") or target_name
-
-    status = user["status"] if user else STATUS_NORMAL
-    display_id = target_id if target_id else "—"
-    display_name = target_name or "—"
-    display_username = target_username or "—"
-
-    text = (
-        f"📇 <b>Проверка</b>\n"
-        f"ID: <code>{display_id}</code>\n"
-        f"Имя: {display_name}\n"
-        f"Юзернейм: @{display_username}\n"
-        f"Статус: {STATUS_LABELS.get(status, status)}\n"
-    )
-    if user and user.get("reason"):
-        text += f"Причина: {user['reason']}\n"
-    if not user:
-        text += ("\n<i>ℹ️ Пользователя пока нет в базе. "
-                 "Он автоматически появится, как только напишет в эту группу "
-                 "или боту.</i>")
-
-    await message.reply(
-        text,
-        reply_markup=profile_kb(
-            target_id if target_id else 0,
-            user.get("evidence_url") if user else None,
-            target_username if target_username else None,
+        await send_status_card(message, user, reply_to=message)
+    else:
+        text = (
+            f"📇 <b>Проверка</b>\n"
+            f"ID: <code>{target_id or '—'}</code>\n"
+            f"Имя: {target_name or '—'}\n"
+            f"Юзернейм: @{target_username or '—'}\n"
+            f"Статус: {STATUS_LABELS[STATUS_NORMAL]}\n"
+            f"\n<i>ℹ️ Пользователя пока нет в базе. Он автоматически "
+            f"появится, как только напишет в эту группу или боту.</i>"
         )
-    )
+        await message.reply(text)
+
+
+# --- Авто-ответ статусом на сообщения скамеров ---
+@router_group.message(IsNotSuperAdmin(), F.text | F.caption)
+async def group_autoreply_status(message: Message):
+    # Не реагируем на команды
+    if message.text and message.text.startswith("/"):
+        return
+    u = await get_user(message.from_user.id)
+    if not u:
+        return
+    status = u.get("status")
+    if status in (STATUS_SCAM, STATUS_BANNED):
+        # Отвечаем реплаем на его сообщение карточкой
+        await send_status_card(message, u, reply_to=message)
 
 
 @router_group.chat_member()
 async def on_chat_member(event: ChatMemberUpdated, bot: Bot):
     new = event.new_chat_member
+    old = event.old_chat_member
+
+    # Приветствие нового участника
+    if old.status in ("left", "kicked") and new.status in ("member", "administrator"):
+        u = new.user
+        text = (
+            f"👋 Добро пожаловать, {u.full_name}!\n\n"
+            f"Это <b>{BOT_NAME}</b>. Здесь собирается информация о скамерах. "
+            f"Будь внимателен и проверяй пользователей через /check."
+        )
+        try:
+            if template_exists(IMAGE_HELLO):
+                await bot.send_photo(event.chat.id,
+                                     FSImage := FSInputFile(template_path(IMAGE_HELLO)),
+                                     caption=text)
+            else:
+                await bot.send_message(event.chat.id, text)
+        except Exception as e:
+            log.warning("Не смог поприветствовать %s: %s", u.id, e)
+
+    # Кик забаненных везде
     if new.status in ("member", "restricted"):
         if await is_banned_anywhere(new.user.id):
             try:
@@ -578,16 +660,39 @@ async def on_chat_member(event: ChatMemberUpdated, bot: Bot):
 
 
 @router_group.my_chat_member()
-async def bot_added(event: ChatMemberUpdated):
+async def bot_added(event: ChatMemberUpdated, bot: Bot):
     if event.new_chat_member.status in ("member", "administrator"):
-        await register_chat(event.chat.id, event.chat.title or str(event.chat.id))
+        await register_chat(event.chat.id,
+                            event.chat.title or str(event.chat.id))
+        # Представимся при добавлении в группу
+        try:
+            text = (
+                f"👋 Привет! Я <b>{BOT_NAME}</b>.\n\n"
+                f"Проверяйте пользователей командой /check @username "
+                f"или реплаем на сообщение."
+            )
+            if template_exists(IMAGE_HELLO):
+                await bot.send_photo(event.chat.id,
+                                     FSInputFile(template_path(IMAGE_HELLO)),
+                                     caption=text)
+            else:
+                await bot.send_message(event.chat.id, text)
+        except Exception as e:
+            log.warning("Не смог представиться в чате %s: %s",
+                        event.chat.id, e)
 
 
 # ---------------- ADMIN ----------------
 @router_admin.message(CommandStart(), IsSuperAdmin())
 async def admin_start(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer("🛠 <b>Админ-панель</b>", reply_markup=admin_menu())
+    text = f"🛠 <b>{BOT_NAME}</b> — админ-панель"
+    if template_exists(IMAGE_START):
+        await message.answer_photo(FSInputFile(template_path(IMAGE_START)),
+                                   caption=text,
+                                   reply_markup=admin_menu())
+    else:
+        await message.answer(text, reply_markup=admin_menu())
 
 
 @router_admin.message(Command("admin"), IsSuperAdmin())
@@ -611,7 +716,7 @@ async def admin_stats(cb: CallbackQuery):
         cur = await db.execute("SELECT COUNT(*) FROM chats")
         chats = (await cur.fetchone())[0]
     await cb.message.answer(
-        f"📊 <b>Статистика</b>\n"
+        f"📊 <b>Статистика {BOT_NAME}</b>\n"
         f"Всего записей: {total}\n"
         f"🚨 Скамеров: {scams}\n"
         f"⛔ Забанено везде: {banned}\n"
@@ -630,8 +735,9 @@ async def admin_set_status(cb: CallbackQuery, state: FSMContext):
         "• <code>@username</code>\n"
         "• <code>123456789</code> (ID)\n"
         "• <code>@username 123456789</code> (оба сразу)\n\n"
-        "ℹ️ Если у пользователя ещё нет записи в базе — укажи ID, "
-        "тогда она создастся сразу."
+        "ℹ️ Если у пользователя ещё нет записи — укажи ID, "
+        "запись создастся сразу.\n"
+        "⚠️ Статус «Администратор» выдать нельзя — он только у тебя."
     )
     await cb.answer()
 
@@ -657,13 +763,11 @@ async def admin_target(message: Message, state: FSMContext):
         )
         return
 
-    # Если дан ID — создаём запись сразу
     if target_id:
         existing = await get_user(target_id)
         if not existing:
             await upsert_user(target_id, target_username, None)
 
-    # Если дан только username — ищем в базе
     if target_id is None and target_username:
         found = await get_user_by_username(target_username)
         if found:
@@ -672,8 +776,7 @@ async def admin_target(message: Message, state: FSMContext):
             await message.answer(
                 "❗ Пользователя с таким @username нет в базе.\n\n"
                 "Telegram не даёт боту ID по username. Варианты:\n"
-                "• дождись, пока он напишет в группу с ботом "
-                "(сохранится автоматически)\n"
+                "• дождись, пока он напишет в группу с ботом\n"
                 "• укажи его ID: <code>@username 123456789</code>"
             )
             await state.clear()
@@ -747,6 +850,8 @@ async def admin_evidence(message: Message, state: FSMContext):
 
 async def _apply_status(target_id, target_username, status,
                         reason, evidence_url, admin_id):
+    if status == STATUS_ADMIN and target_id != SUPER_ADMIN_ID:
+        return
     if target_id is None and target_username:
         found = await get_user_by_username(target_username)
         if found:
@@ -866,12 +971,15 @@ async def main():
               default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
 
+    # Гарантируем, что админ есть в базе со статусом admin
+    await upsert_user(SUPER_ADMIN_ID)
+
     dp.include_router(router_admin)
     dp.include_router(router_group)
     dp.include_router(router_user)
 
     await bot.delete_webhook(drop_pending_updates=True)
-    log.info("Бот запущен, админ=%s", SUPER_ADMIN_ID)
+    log.info("%s запущен, админ=%s", BOT_NAME, SUPER_ADMIN_ID)
     await dp.start_polling(bot)
 
 
