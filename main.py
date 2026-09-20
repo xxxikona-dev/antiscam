@@ -226,7 +226,6 @@ async def init_db():
             added_at TEXT
         )
         """)
-        # Обязательные группы для чатов
         await db.execute("""
         CREATE TABLE IF NOT EXISTS required_chats (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -375,7 +374,7 @@ async def delete_cached_file_id(key: str):
 # ==========================================================
 # БАЗА: ОБЯЗАТЕЛЬНЫЕ ГРУППЫ
 # ==========================================================
-async def add_required_chat(chat_id: int, req_chat_id, req_username, title,
+async def add_required_chat(chat_id, req_chat_id, req_username, title,
                             link, expire_at, added_by):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -388,8 +387,7 @@ async def add_required_chat(chat_id: int, req_chat_id, req_username, title,
         await db.commit()
 
 
-async def list_required_chats(chat_id: int):
-    """Возвращает активные требования (учитывая expire_at)."""
+async def list_required_chats(chat_id):
     now = datetime.utcnow().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -401,14 +399,13 @@ async def list_required_chats(chat_id: int):
         return [dict(r) for r in await cur.fetchall()]
 
 
-async def delete_required_chat(req_id: int):
+async def delete_required_chat(req_id):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM required_chats WHERE id=?", (req_id,))
         await db.commit()
 
 
 async def cleanup_expired_required_chats():
-    """Удаляет просроченные требования."""
     now = datetime.utcnow().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -418,27 +415,17 @@ async def cleanup_expired_required_chats():
 
 
 # ==========================================================
-# УТИЛИТЫ ДЛЯ ПРОВЕРКИ ПОДПИСКИ
+# УТИЛИТЫ
 # ==========================================================
 def parse_duration(raw: str):
-    """
-    '0' → None (бессрочно)
-    '30m' → 30 минут
-    '1h' → 1 час
-    '1d' → 1 день
-    '5' → 5 часов (по умолчанию часы, если без суффикса)
-    Возвращает datetime UTC или None.
-    """
     raw = raw.strip().lower()
     if raw == "0":
         return None
-
     m = re.fullmatch(r"(\d+)([mhd]?)", raw)
     if not m:
         return None
     value = int(m.group(1))
     unit = m.group(2) or "h"
-
     if unit == "m":
         delta = timedelta(minutes=value)
     elif unit == "h":
@@ -451,18 +438,10 @@ def parse_duration(raw: str):
 
 
 def parse_link(raw: str):
-    """
-    Возвращает (username, link) или (None, None), если невалидно.
-    Принимает:
-      @username
-      https://t.me/username
-      t.me/username
-    """
     raw = raw.strip()
     if raw.startswith("@"):
         username = raw[1:]
         return username, f"https://t.me/{username}"
-
     m = re.fullmatch(r"(?:https?://)?t\.me/([A-Za-z0-9_]+)/?", raw)
     if m:
         username = m.group(1)
@@ -471,7 +450,6 @@ def parse_link(raw: str):
 
 
 async def get_chat_title(bot: Bot, username: str) -> str:
-    """Пытается получить название чата, иначе возвращает @username."""
     try:
         chat = await bot.get_chat(f"@{username}")
         return chat.title or chat.full_name or f"@{username}"
@@ -480,10 +458,9 @@ async def get_chat_title(bot: Bot, username: str) -> str:
 
 
 async def is_user_subscribed(bot: Bot, user_id: int, req: dict) -> bool:
-    """Проверяет, подписан ли user_id на чат из требования."""
     try:
-        member = await bot.get_chat_member(req["req_chat_id"] or f"@{req['req_username']}",
-                                            user_id)
+        member = await bot.get_chat_member(
+            req["req_chat_id"] or f"@{req['req_username']}", user_id)
         return member.status in (
             ChatMemberStatus.CREATOR,
             ChatMemberStatus.ADMINISTRATOR,
@@ -491,26 +468,26 @@ async def is_user_subscribed(bot: Bot, user_id: int, req: dict) -> bool:
             ChatMemberStatus.RESTRICTED,
         )
     except TelegramBadRequest as e:
-        # Например, "user not found" — значит не подписан
-        log.info("get_chat_member для %s в %s: %s", user_id, req["req_username"], e)
+        log.info("get_chat_member %s@%s: %s", user_id, req["req_username"], e)
         return False
     except Exception as e:
         log.warning("Ошибка проверки подписки: %s", e)
         return False
 
 
-async def check_user_all_subscriptions(bot: Bot, user_id: int,
-                                       chat_id: int):
-    """
-    Возвращает список требований, которым пользователь НЕ соответствует.
-    Если список пуст — можно писать.
-    """
+async def check_user_all_subscriptions(bot: Bot, user_id: int, chat_id: int):
     reqs = await list_required_chats(chat_id)
     missing = []
     for r in reqs:
         if not await is_user_subscribed(bot, user_id, r):
             missing.append(r)
     return missing
+
+
+def user_mention(user) -> str:
+    if user.username:
+        return f"@{user.username}"
+    return f'<a href="tg://user?id={user.id}">{user.full_name}</a>'
 
 
 # ==========================================================
@@ -655,54 +632,102 @@ class AutoRegisterMiddleware(BaseMiddleware):
 
 
 # ==========================================================
-# ГЕЙТ: обязательная подписка для сообщений в группе
+# ГЕЙТ ПОДПИСКИ — только на сообщения не подписанных
 # ==========================================================
 class SubscriptionGateMiddleware(BaseMiddleware):
     """
-    Ловит сообщения в группах. Если чат требует подписку,
-    а пользователь не подписан — удаляет сообщение и просит подписаться.
+    Срабатывает ТОЛЬКО на сообщения не подписанных пользователей
+    в чатах, где есть активные требования. Пропускает:
+      • не-групповые чаты
+      • ботов
+      • главного админа
+      • админов чата
+      • сервисные сообщения (вход/выход/закреп и т.п.)
+      • команды (/start, /check, /addgroup и т.д.)
     """
+
     async def __call__(self, handler, event, data):
         if not isinstance(event, Message):
             return await handler(event, data)
 
         chat = event.chat
+        # Только группы/супергруппы
         if chat.type not in ("group", "supergroup"):
+            return await handler(event, data)
+
+        # Сервисные сообщения (новый участник, закреп и т.д.) — пропускаем
+        if (event.new_chat_members or event.left_chat_member
+                or event.new_chat_title or event.new_chat_photo
+                or event.delete_chat_photo or event.pinned_message
+                or event.group_chat_created or event.supergroup_chat_created
+                or event.channel_chat_created or event.migrate_to_chat_id
+                or event.migrate_from_chat_id):
             return await handler(event, data)
 
         user = event.from_user
         if not user or user.is_bot:
             return await handler(event, data)
 
-        # Админ и главный админ — пропускаем
         if user.id == SUPER_ADMIN_ID:
             return await handler(event, data)
+
+        # Сначала проверим, есть ли требования в этом чате
+        try:
+            reqs = await list_required_chats(chat.id)
+        except Exception as e:
+            log.warning("Gate: не смог получить требования: %s", e)
+            return await handler(event, data)
+
+        if not reqs:
+            # нет требований — не трогаем
+            return await handler(event, data)
+
+        # Админов чата не трогаем
         try:
             member = await event.bot.get_chat_member(chat.id, user.id)
             if member.status in (ChatMemberStatus.CREATOR,
                                   ChatMemberStatus.ADMINISTRATOR):
                 return await handler(event, data)
-        except Exception:
-            pass
-
-        # Проверяем требования
-        try:
-            missing = await check_user_all_subscriptions(event.bot, user.id, chat.id)
         except Exception as e:
-            log.warning("SubscriptionGate: %s", e)
+            log.info("Gate: не смог получить member %s: %s", user.id, e)
+
+        # Команды пропускаем — иначе юзер не сможет даже /start нажать
+        text = event.text or event.caption or ""
+        if text.startswith("/"):
+            return await handler(event, data)
+
+        # Проверяем подписки
+        try:
+            missing = await check_user_all_subscriptions(
+                event.bot, user.id, chat.id)
+        except Exception as e:
+            log.warning("Gate: ошибка проверки подписок: %s", e)
             return await handler(event, data)
 
         if not missing:
+            # всё ок — пропускаем
             return await handler(event, data)
 
+        # ============ НЕ ПОДПИСАН ============
         # Удаляем сообщение пользователя
         try:
             await event.bot.delete_message(chat.id, event.message_id)
+            log.info("Удалено сообщение %s от %s в чате %s",
+                     event.message_id, user.id, chat.id)
+        except TelegramForbiddenError as e:
+            log.error("НЕТ ПРАВА УДАЛЯТЬ в чате %s: %s. "
+                      "Сделай бота админом с правом 'Delete messages'.",
+                      chat.id, e)
+        except TelegramBadRequest as e:
+            log.warning("Не смог удалить сообщение %s: %s",
+                        event.message_id, e)
         except Exception as e:
-            log.warning("Не смог удалить сообщение: %s", e)
+            log.warning("Ошибка удаления: %s", e)
 
-        # Формируем ответ
-        lines = ["🚫 <b>Чтобы писать в этом чате, нужно подписаться на:</b>\n"]
+        # Отвечаем с тегом
+        mention = user_mention(user)
+        lines = [f"{mention}, 🚫 <b>чтобы писать в этом чате, "
+                 f"нужно подписаться на:</b>\n"]
         kb_rows = []
         for r in missing:
             title = r["title"] or f"@{r['req_username']}"
@@ -710,16 +735,17 @@ class SubscriptionGateMiddleware(BaseMiddleware):
             lines.append(f"• <a href=\"{link}\">{title}</a>")
             kb_rows.append([InlineKeyboardButton(text=f"📎 {title}", url=link)])
 
-        text = "\n".join(lines) + "\n\n<i>После подписки попробуй снова.</i>"
+        text_out = "\n".join(lines) + "\n\n<i>После подписки напиши снова.</i>"
         kb = InlineKeyboardMarkup(inline_keyboard=kb_rows) if kb_rows else None
 
         try:
-            await event.bot.send_message(chat.id, text, reply_markup=kb,
+            await event.bot.send_message(chat.id, text_out,
+                                          reply_markup=kb,
                                           disable_web_page_preview=True)
         except Exception as e:
             log.warning("Не смог отправить требование подписки: %s", e)
 
-        # Не пропускаем дальше
+        # Не пропускаем дальше — сообщение уже удалено
         return
 
 
@@ -785,12 +811,10 @@ def appeal_admin_kb(appeal_id):
     ])
 
 
-def remgroup_kb(chat_id: int, reqs: list[dict]):
-    """Кнопки удаления требований. chat_id в callback, чтобы отличить."""
+def remgroup_kb(chat_id, reqs):
     rows = []
     for r in reqs:
         title = r["title"] or f"@{r['req_username']}"
-        # обрезаем длинные названия
         btn_text = f"🗑 {title}"[:60]
         rows.append([InlineKeyboardButton(
             text=btn_text,
@@ -819,19 +843,18 @@ router_admin = Router()
 router_group = Router()
 router_user = Router()
 
-# Автосохранение — на всех
 router_user.message.outer_middleware(AutoRegisterMiddleware())
 router_user.callback_query.outer_middleware(AutoRegisterMiddleware())
 router_group.message.outer_middleware(AutoRegisterMiddleware())
 router_group.callback_query.outer_middleware(AutoRegisterMiddleware())
 router_group.chat_member.outer_middleware(AutoRegisterMiddleware())
 
-# Гейт подписки — только на router_group.message
+# Гейт — только на router_group.message
 router_group.message.outer_middleware(SubscriptionGateMiddleware())
 
 
 # ==========================================================
-# ХЕЛПЕР: является ли пользователь админом чата
+# ХЕЛПЕР
 # ==========================================================
 async def is_chat_admin(bot: Bot, chat_id: int, user_id: int) -> bool:
     if user_id == SUPER_ADMIN_ID:
@@ -948,7 +971,6 @@ async def appeal_evidence(message: Message, state: FSMContext, bot: Bot):
 
 # ---------------- GROUP ----------------
 
-# --- /addgroup <ссылка> <время> ---
 @router_group.message(Command("addgroup"), IsGroupChat())
 async def cmd_addgroup(message: Message, bot: Bot):
     if not await is_chat_admin(bot, message.chat.id, message.from_user.id):
@@ -983,7 +1005,6 @@ async def cmd_addgroup(message: Message, bot: Bot):
                              "<code>1h</code>, <code>7d</code>, <code>0</code>.")
         return
 
-    # Получаем title и реальный chat_id
     title = await get_chat_title(bot, username)
     req_chat_id = None
     try:
@@ -1018,7 +1039,6 @@ async def cmd_addgroup(message: Message, bot: Bot):
     )
 
 
-# --- /remgroup ---
 @router_group.message(Command("remgroup"), IsGroupChat())
 async def cmd_remgroup(message: Message, bot: Bot):
     if not await is_chat_admin(bot, message.chat.id, message.from_user.id):
@@ -1036,7 +1056,6 @@ async def cmd_remgroup(message: Message, bot: Bot):
     await message.reply(text, reply_markup=kb)
 
 
-# --- /listgroup (бонус: посмотреть список без удаления) ---
 @router_group.message(Command("listgroup"), IsGroupChat())
 async def cmd_listgroup(message: Message, bot: Bot):
     if not await is_chat_admin(bot, message.chat.id, message.from_user.id):
@@ -1107,7 +1126,6 @@ async def cmd_check(message: Message):
         await message.reply(text)
 
 
-# --- Callback удаления требования ---
 @router_group.callback_query(F.data.startswith("remgroup:"))
 async def cb_remgroup(cb: CallbackQuery, bot: Bot):
     try:
@@ -1126,7 +1144,6 @@ async def cb_remgroup(cb: CallbackQuery, bot: Bot):
     await log_action(cb.from_user.id, "delete_required_chat", chat_id,
                      f"req_id={req_id}")
 
-    # Удаляем сообщение с кнопками
     try:
         await cb.message.delete()
     except Exception:
@@ -1147,9 +1164,9 @@ async def on_chat_member(event: ChatMemberUpdated, bot: Bot):
             mention = f'<a href="tg://user?id={u.id}">{u.full_name}</a>'
 
         text = (
-            f"👋 Добро пожаловать, {mention}!\n\n"
-            f"Это <b>{BOT_NAME}</b>. Здесь собирается информация о скамерах. "
-            f"Проверяй пользователей через /check."
+            f"👋 Добро пожаловать в <b>{event.chat.title or 'этот чат'}</b>, "
+            f"{mention}!\n\n"
+            f"Приятного общения! 🎉"
         )
         try:
             await send_photo_cached(bot, event.chat.id, IMAGE_HELLO, text,
@@ -1173,10 +1190,10 @@ async def bot_added(event: ChatMemberUpdated, bot: Bot):
                             event.chat.title or str(event.chat.id))
         try:
             text = (
-                f"👋 Привет! Я <b>{BOT_NAME}</b>.\n\n"
-                f"Проверяйте пользователей командой /check @username "
-                f"или реплаем на сообщение.\n\n"
-                f"Админ может настроить обязательную подписку: "
+                f"👋 Привет! Я бот-помощник этого чата.\n\n"
+                f"Проверяйте пользователей командой "
+                f"<code>/check @username</code> или реплаем на сообщение.\n"
+                f"Администраторы могут настроить обязательную подписку: "
                 f"<code>/addgroup &lt;ссылка&gt; &lt;время&gt;</code>"
             )
             await send_photo_cached(bot, event.chat.id, IMAGE_HELLO, text,
@@ -1186,7 +1203,6 @@ async def bot_added(event: ChatMemberUpdated, bot: Bot):
                         event.chat.id, e)
 
 
-# --- авто-ответ скамеру (последний) ---
 @router_group.message(IsNotSuperAdmin(), IsGroupChat(), F.text | F.caption)
 async def group_autoreply_status(message: Message):
     text = message.text or message.caption or ""
@@ -1478,7 +1494,7 @@ async def appeal_reject(cb: CallbackQuery, state: FSMContext, bot: Bot):
 
 
 # ==========================================================
-# ФОНОВАЯ ЗАДАЧА: чистка просроченных требований
+# ФОНОВАЯ ЗАДАЧА
 # ==========================================================
 async def cleaner_task():
     while True:
@@ -1486,7 +1502,7 @@ async def cleaner_task():
             await cleanup_expired_required_chats()
         except Exception as e:
             log.warning("cleaner: %s", e)
-        await asyncio.sleep(600)  # раз в 10 минут
+        await asyncio.sleep(600)
 
 
 # ==========================================================
