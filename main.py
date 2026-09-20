@@ -47,6 +47,7 @@ os.makedirs(TEMPLATES_DIR, exist_ok=True)
 os.makedirs(TEMPLATES_CACHE_DIR, exist_ok=True)
 
 BOT_NAME = "Скам база XkeyO"
+MAX_CAPTION = 1024  # лимит Telegram для caption у фото
 
 # ==========================================================
 # СТАТУСЫ
@@ -122,7 +123,7 @@ def compress_image(src: str, dst: str, max_side: int = 1280, quality: int = 85):
         return src
 
 
-def prepare_image(filename: str) -> str | None:
+def prepare_image(filename: str):
     """Возвращает путь к сжатой версии картинки или None."""
     src = template_path(filename)
     if not os.path.isfile(src):
@@ -133,6 +134,12 @@ def prepare_image(filename: str) -> str | None:
             or os.path.getmtime(src) > os.path.getmtime(dst)):
         return compress_image(src, dst)
     return dst
+
+
+def _cut_caption(text: str) -> str:
+    if len(text) <= MAX_CAPTION:
+        return text
+    return text[:MAX_CAPTION - 20] + "\n\n<i>…(сокращено)</i>"
 
 
 # ==========================================================
@@ -344,25 +351,26 @@ async def cache_file_id(key: str, file_id: str):
         await db.commit()
 
 
+async def delete_cached_file_id(key: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM media_cache WHERE key=?", (key,))
+        await db.commit()
+
+
 # ==========================================================
 # УНИВЕРСАЛЬНАЯ ОТПРАВКА КАРТИНОК С КЭШЕМ
 # ==========================================================
 async def send_photo_cached(
     bot_or_message,
-    chat_id: int | None,
+    chat_id,
     img_name: str,
     caption: str,
     reply_markup=None,
-    reply_to_message_id: int | None = None,
+    reply_to_message_id=None,
     cache_prefix: str = "img",
 ):
-    """
-    bot_or_message — либо Message (отвечаем в тот же чат),
-                     либо Bot (шлём в chat_id).
-    Возвращает отправленное сообщение.
-    """
     cache_key = f"{cache_prefix}:{img_name}"
-    cached_id = await get_cached_file_id(cache_key)
+    safe_caption = _cut_caption(caption)
 
     kwargs = {}
     if reply_markup is not None:
@@ -373,28 +381,50 @@ async def send_photo_cached(
     async def _send_photo(file_or_id):
         if isinstance(bot_or_message, Message):
             return await bot_or_message.answer_photo(
-                file_or_id, caption=caption, **kwargs)
+                file_or_id, caption=safe_caption, **kwargs)
         return await bot_or_message.send_photo(
-            chat_id, file_or_id, caption=caption, **kwargs)
+            chat_id, file_or_id, caption=safe_caption, **kwargs)
 
     async def _send_text():
         if isinstance(bot_or_message, Message):
             return await bot_or_message.answer(caption, **kwargs)
         return await bot_or_message.send_message(chat_id, caption, **kwargs)
 
+    # 1. Пробуем кэш
+    cached_id = await get_cached_file_id(cache_key)
     if cached_id:
         try:
             return await _send_photo(cached_id)
         except Exception as e:
-            log.warning("Кэш %s устарел (%s), перезагружаю", cache_key, e)
+            log.warning("Кэш %s не сработал (%s) — удаляю и гружу заново",
+                        cache_key, e)
+            await delete_cached_file_id(cache_key)
 
+    # 2. Готовим файл
     img_full = prepare_image(img_name)
-    if img_full:
+    if img_full is None:
+        log.warning("Файл шаблона отсутствует: %s — отправляю текстом",
+                    img_name)
+        return await _send_text()
+
+    log.info("Загружаю новую картинку: %s (из %s)", img_name, img_full)
+
+    # 3. Отправляем и кэшируем
+    try:
         msg = await _send_photo(FSInputFile(img_full))
-        if msg and getattr(msg, "photo", None):
+    except Exception as e:
+        log.warning("send_photo(%s) упал: %s — отправляю текстом",
+                    img_name, e)
+        return await _send_text()
+
+    if msg and getattr(msg, "photo", None):
+        try:
             await cache_file_id(cache_key, msg.photo[-1].file_id)
-        return msg
-    return await _send_text()
+            log.info("Картинка %s закэширована", img_name)
+        except Exception as e:
+            log.warning("Не смог закэшировать file_id: %s", e)
+
+    return msg
 
 
 # ==========================================================
@@ -402,9 +432,6 @@ async def send_photo_cached(
 # ==========================================================
 async def send_status_card(target, user_data: dict, extra_text: str = "",
                            reply_to: Message | None = None):
-    """
-    target — Message или объект с .answer_photo / .answer
-    """
     status = user_data.get("status", STATUS_NORMAL)
     label = STATUS_LABELS.get(status, status)
     img_name = STATUS_IMAGES.get(status, IMAGE_NORMAL_FALLBACK)
@@ -429,7 +456,9 @@ async def send_status_card(target, user_data: dict, extra_text: str = "",
 
     reply_to_id = reply_to.message_id if reply_to else None
 
-    # target может быть Message или CallbackQuery.message — оба умеют answer_photo
+    log.info("send_status_card: статус=%s, img=%s, target=%s",
+             status, img_name, type(target).__name__)
+
     return await send_photo_cached(
         target, None, img_name, text,
         reply_markup=kb,
