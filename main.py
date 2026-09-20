@@ -3,7 +3,9 @@ import asyncio
 import logging
 import os
 import re
+import time
 from datetime import datetime, timedelta
+from collections import defaultdict, deque
 
 import aiosqlite
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
@@ -88,6 +90,122 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 log = logging.getLogger("antiscam")
+
+
+# ==========================================================
+# АНТИСПАМ: константы
+# ==========================================================
+LINK_REGEX = re.compile(
+    r"(https?://\S+|t\.me/\S+|www\.\S+)",
+    re.IGNORECASE,
+)
+
+USERNAME_ONLY_REGEX = re.compile(r"^@[A-Za-z0-9_]{5,32}$")
+
+CAPS_MIN_LEN = 10
+CAPS_RATIO = 0.7
+
+FLOOD_WINDOW = 60
+FLOOD_LIMIT = 10
+FLOOD_MUTE_SECONDS = 300
+
+flood_store = defaultdict(lambda: defaultdict(deque))
+
+
+# ==========================================================
+# КЕШИ ДЛЯ СКОРОСТИ
+# ==========================================================
+# Кеш админов чата: {(chat_id, user_id): (timestamp, bool)}
+_ADMIN_CACHE: dict[tuple[int, int], tuple[float, bool]] = {}
+_ADMIN_CACHE_TTL = 300  # 5 минут
+
+# Кеш подписок: {(chat_id, user_id): (timestamp, bool)}
+_SUB_CACHE: dict[tuple[int, int], tuple[float, bool]] = {}
+_SUB_CACHE_TTL = 30  # 30 секунд
+
+# Кеш требований чата: {chat_id: (timestamp, list[dict])}
+_REQ_CACHE: dict[int, tuple[float, list]] = {}
+_REQ_CACHE_TTL = 60
+
+
+def _cache_get(store, key, ttl):
+    v = store.get(key)
+    if not v:
+        return None
+    ts, val = v
+    if (time.time() - ts) > ttl:
+        return None
+    return val
+
+
+def _cache_set(store, key, val):
+    store[key] = (time.time(), val)
+
+
+def invalidate_admin_cache(chat_id: int = None):
+    if chat_id is None:
+        _ADMIN_CACHE.clear()
+    else:
+        for k in list(_ADMIN_CACHE.keys()):
+            if k[0] == chat_id:
+                _ADMIN_CACHE.pop(k, None)
+
+
+def invalidate_req_cache(chat_id: int = None):
+    if chat_id is None:
+        _REQ_CACHE.clear()
+    else:
+        _REQ_CACHE.pop(chat_id, None)
+
+
+def invalidate_sub_cache(chat_id: int = None):
+    if chat_id is None:
+        _SUB_CACHE.clear()
+    else:
+        for k in list(_SUB_CACHE.keys()):
+            if k[0] == chat_id:
+                _SUB_CACHE.pop(k, None)
+
+
+# ==========================================================
+# Быстрые локальные проверки
+# ==========================================================
+def has_link(text: str) -> bool:
+    if not text:
+        return False
+    cleaned = re.sub(r"@[A-Za-z0-9_]{5,32}", "", text)
+    return bool(LINK_REGEX.search(cleaned))
+
+
+def is_caps(text: str) -> bool:
+    if not text:
+        return False
+    letters = [c for c in text if c.isalpha()]
+    if len(letters) < CAPS_MIN_LEN:
+        return False
+    upper = sum(1 for c in letters if c.isupper())
+    return (upper / len(letters)) >= CAPS_RATIO
+
+
+def normalize_text(text: str) -> str:
+    if not text:
+        return ""
+    return re.sub(r"\s+", " ", text.strip().lower())
+
+
+def is_flood(chat_id: int, user_id: int, text: str) -> bool:
+    now = time.time()
+    bucket = flood_store[chat_id][user_id]
+    norm = normalize_text(text)
+    while bucket and (now - bucket[0][0]) > FLOOD_WINDOW:
+        bucket.popleft()
+    same = sum(1 for ts, t in bucket if t == norm)
+    bucket.append((now, norm))
+    return same >= FLOOD_LIMIT
+
+
+def clear_flood(chat_id: int, user_id: int):
+    flood_store[chat_id].pop(user_id, None)
 
 
 # ==========================================================
@@ -385,9 +503,11 @@ async def add_required_chat(chat_id, req_chat_id, req_username, title,
         """, (chat_id, req_chat_id, req_username, title, link,
               expire_at, datetime.utcnow().isoformat(), added_by))
         await db.commit()
+    invalidate_req_cache(chat_id)
+    invalidate_sub_cache(chat_id)
 
 
-async def list_required_chats(chat_id):
+async def list_required_chats_db(chat_id):
     now = datetime.utcnow().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -399,10 +519,30 @@ async def list_required_chats(chat_id):
         return [dict(r) for r in await cur.fetchall()]
 
 
+async def list_required_chats(chat_id):
+    """С кешем на 60 секунд."""
+    cached = _cache_get(_REQ_CACHE, chat_id, _REQ_CACHE_TTL)
+    if cached is not None:
+        return cached
+    reqs = await list_required_chats_db(chat_id)
+    _cache_set(_REQ_CACHE, chat_id, reqs)
+    return reqs
+
+
 async def delete_required_chat(req_id):
     async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT chat_id FROM required_chats WHERE id=?", (req_id,))
+        row = await cur.fetchone()
+        if row:
+            chat_id = row[0]
+        else:
+            chat_id = None
         await db.execute("DELETE FROM required_chats WHERE id=?", (req_id,))
         await db.commit()
+    if chat_id is not None:
+        invalidate_req_cache(chat_id)
+        invalidate_sub_cache(chat_id)
 
 
 async def cleanup_expired_required_chats():
@@ -412,6 +552,8 @@ async def cleanup_expired_required_chats():
             "DELETE FROM required_chats WHERE expire_at IS NOT NULL AND expire_at <= ?",
             (now,))
         await db.commit()
+    invalidate_req_cache()
+    invalidate_sub_cache()
 
 
 # ==========================================================
@@ -458,10 +600,15 @@ async def get_chat_title(bot: Bot, username: str) -> str:
 
 
 async def is_user_subscribed(bot: Bot, user_id: int, req: dict) -> bool:
+    """С кешем на 30 секунд."""
+    key = (req["req_chat_id"] or 0, user_id)
+    cached = _cache_get(_SUB_CACHE, key, _SUB_CACHE_TTL)
+    if cached is not None:
+        return cached
     try:
         member = await bot.get_chat_member(
             req["req_chat_id"] or f"@{req['req_username']}", user_id)
-        return member.status in (
+        ok = member.status in (
             ChatMemberStatus.CREATOR,
             ChatMemberStatus.ADMINISTRATOR,
             ChatMemberStatus.MEMBER,
@@ -469,19 +616,24 @@ async def is_user_subscribed(bot: Bot, user_id: int, req: dict) -> bool:
         )
     except TelegramBadRequest as e:
         log.info("get_chat_member %s@%s: %s", user_id, req["req_username"], e)
-        return False
+        ok = False
     except Exception as e:
         log.warning("Ошибка проверки подписки: %s", e)
-        return False
+        ok = False
+    _cache_set(_SUB_CACHE, key, ok)
+    return ok
 
 
 async def check_user_all_subscriptions(bot: Bot, user_id: int, chat_id: int):
+    """Параллельно проверяет все требования."""
     reqs = await list_required_chats(chat_id)
-    missing = []
-    for r in reqs:
-        if not await is_user_subscribed(bot, user_id, r):
-            missing.append(r)
-    return missing
+    if not reqs:
+        return []
+    results = await asyncio.gather(
+        *(is_user_subscribed(bot, user_id, r) for r in reqs),
+        return_exceptions=False,
+    )
+    return [r for r, ok in zip(reqs, results) if not ok]
 
 
 def user_mention(user) -> str:
@@ -490,8 +642,42 @@ def user_mention(user) -> str:
     return f'<a href="tg://user?id={user.id}">{user.full_name}</a>'
 
 
+async def is_chat_admin(bot: Bot, chat_id: int, user_id: int) -> bool:
+    """С кешем на 5 минут. Главный админ — всегда True."""
+    if user_id == SUPER_ADMIN_ID:
+        return True
+    key = (chat_id, user_id)
+    cached = _cache_get(_ADMIN_CACHE, key, _ADMIN_CACHE_TTL)
+    if cached is not None:
+        return cached
+    try:
+        m = await bot.get_chat_member(chat_id, user_id)
+        ok = m.status in (ChatMemberStatus.CREATOR,
+                           ChatMemberStatus.ADMINISTRATOR)
+    except Exception:
+        ok = False
+    _cache_set(_ADMIN_CACHE, key, ok)
+    return ok
+
+
+async def is_chat_admin_fast(bot: Bot, chat_id: int, user_id: int) -> bool:
+    """
+    Быстрая проверка админа через кеш. Если нет — считаем не админом
+    и запрашиваем обновление в фоне.
+    """
+    if user_id == SUPER_ADMIN_ID:
+        return True
+    key = (chat_id, user_id)
+    cached = _cache_get(_ADMIN_CACHE, key, _ADMIN_CACHE_TTL)
+    if cached is not None:
+        return cached
+    # Нет в кеше — не блокируем. Обновим в фоне.
+    asyncio.create_task(is_chat_admin(bot, chat_id, user_id))
+    return False
+
+
 # ==========================================================
-# УНИВЕРСАЛЬНАЯ ОТПРАВКА КАРТИНОК С КЭШЕМ
+# ОТПРАВКА КАРТИНОК С КЭШЕМ
 # ==========================================================
 async def send_photo_cached(
     bot_or_message,
@@ -632,18 +818,24 @@ class AutoRegisterMiddleware(BaseMiddleware):
 
 
 # ==========================================================
-# ГЕЙТ ПОДПИСКИ — только на сообщения не подписанных
+# ГЕЙТ ПОДПИСКИ — УДАЛЕНИЕ МГНОВЕННОЕ
 # ==========================================================
+def _is_service_message(event: Message) -> bool:
+    return bool(
+        event.new_chat_members or event.left_chat_member
+        or event.new_chat_title or event.new_chat_photo
+        or event.delete_chat_photo or event.pinned_message
+        or event.group_chat_created or event.supergroup_chat_created
+        or event.channel_chat_created or event.migrate_to_chat_id
+        or event.migrate_from_chat_id
+    )
+
+
 class SubscriptionGateMiddleware(BaseMiddleware):
     """
-    Срабатывает ТОЛЬКО на сообщения не подписанных пользователей
-    в чатах, где есть активные требования. Пропускает:
-      • не-групповые чаты
-      • ботов
-      • главного админа
-      • админов чата
-      • сервисные сообщения (вход/выход/закреп и т.п.)
-      • команды (/start, /check, /addgroup и т.д.)
+    Сначала — быстрые локальные проверки. Если чат точно не имеет
+    требований (кеш), сразу пропускаем. Если имеет и юзер не в кеше
+    админов — удаляем сообщение, потом уже проверяем всё остальное.
     """
 
     async def __call__(self, handler, event, data):
@@ -651,17 +843,10 @@ class SubscriptionGateMiddleware(BaseMiddleware):
             return await handler(event, data)
 
         chat = event.chat
-        # Только группы/супергруппы
         if chat.type not in ("group", "supergroup"):
             return await handler(event, data)
 
-        # Сервисные сообщения (новый участник, закреп и т.д.) — пропускаем
-        if (event.new_chat_members or event.left_chat_member
-                or event.new_chat_title or event.new_chat_photo
-                or event.delete_chat_photo or event.pinned_message
-                or event.group_chat_created or event.supergroup_chat_created
-                or event.channel_chat_created or event.migrate_to_chat_id
-                or event.migrate_from_chat_id):
+        if _is_service_message(event):
             return await handler(event, data)
 
         user = event.from_user
@@ -671,81 +856,211 @@ class SubscriptionGateMiddleware(BaseMiddleware):
         if user.id == SUPER_ADMIN_ID:
             return await handler(event, data)
 
-        # Сначала проверим, есть ли требования в этом чате
-        try:
-            reqs = await list_required_chats(chat.id)
-        except Exception as e:
-            log.warning("Gate: не смог получить требования: %s", e)
+        # === БЫСТРАЯ ПРОВЕРКА ИЗ КЕША ===
+        reqs = _cache_get(_REQ_CACHE, chat.id, _REQ_CACHE_TTL)
+        if reqs is None:
+            # Кеша нет — грузим в фоне, а пока пропускаем
+            asyncio.create_task(list_required_chats(chat.id))
             return await handler(event, data)
 
         if not reqs:
-            # нет требований — не трогаем
+            # Требований нет — сразу пропускаем без сетевых запросов
             return await handler(event, data)
 
-        # Админов чата не трогаем
-        try:
-            member = await event.bot.get_chat_member(chat.id, user.id)
-            if member.status in (ChatMemberStatus.CREATOR,
-                                  ChatMemberStatus.ADMINISTRATOR):
-                return await handler(event, data)
-        except Exception as e:
-            log.info("Gate: не смог получить member %s: %s", user.id, e)
+        # === ЕСТЬ ТРЕБОВАНИЯ. Проверяем админа быстро из кеша ===
+        admin_flag = _cache_get(_ADMIN_CACHE, (chat.id, user.id),
+                                _ADMIN_CACHE_TTL)
+        if admin_flag is True:
+            return await handler(event, data)
 
-        # Команды пропускаем — иначе юзер не сможет даже /start нажать
         text = event.text or event.caption or ""
         if text.startswith("/"):
             return await handler(event, data)
 
-        # Проверяем подписки
-        try:
-            missing = await check_user_all_subscriptions(
-                event.bot, user.id, chat.id)
-        except Exception as e:
-            log.warning("Gate: ошибка проверки подписок: %s", e)
-            return await handler(event, data)
+        # === БЫСТРАЯ ПРОВЕРКА ПОДПИСОК ИЗ КЕША ===
+        # Если для юзера есть ВСЕ результаты по всем требованиям и
+        # среди них нет False — пропускаем. Если есть хоть один False —
+        # сразу удаляем, не ждём.
+        missing_cached = []
+        all_cached = True
+        for r in reqs:
+            key = (r["req_chat_id"] or 0, user.id)
+            v = _cache_get(_SUB_CACHE, key, _SUB_CACHE_TTL)
+            if v is None:
+                all_cached = False
+                break
+            if not v:
+                missing_cached.append(r)
 
+        if all_cached:
+            if not missing_cached:
+                return await handler(event, data)
+            # Юзер точно не подписан — удаляем немедленно
+            await _delete_and_notify(event, user, missing_cached,
+                                     reason="подписка")
+            return
+
+        # Кеша нет — надо проверить через API. Чтобы не тормозить,
+        # удаляем сразу (если триггер — не подписка), а полную проверку
+        # делаем после удаления. Если вдруг окажется, что юзер подписан —
+        # ничего страшного, сообщение уже удалено.
+        # НО: если требований несколько, а юзер подписан — его сообщение
+        # удалять нельзя. Поэтому здесь компромисс: ждём проверку,
+        # но все запросы идут параллельно.
+        missing = await check_user_all_subscriptions(event.bot, user.id,
+                                                     chat.id)
         if not missing:
-            # всё ок — пропускаем
             return await handler(event, data)
 
-        # ============ НЕ ПОДПИСАН ============
-        # Удаляем сообщение пользователя
+        await _delete_and_notify(event, user, missing, reason="подписка")
+        return
+
+
+async def _delete_and_notify(event: Message, user, missing: list, reason: str):
+    """Удаляет сообщение и отправляет требование подписки."""
+    chat = event.chat
+    try:
+        await event.bot.delete_message(chat.id, event.message_id)
+        log.info("Удалено (%s) msg=%s user=%s chat=%s",
+                 reason, event.message_id, user.id, chat.id)
+    except TelegramForbiddenError as e:
+        log.error("Нет права удалять в %s: %s", chat.id, e)
+    except TelegramBadRequest as e:
+        log.warning("Не смог удалить %s: %s", event.message_id, e)
+    except Exception as e:
+        log.warning("Ошибка удаления: %s", e)
+
+    mention = user_mention(user)
+    lines = [f"{mention}, 🚫 <b>чтобы писать в этом чате, "
+             f"нужно подписаться на:</b>\n"]
+    kb_rows = []
+    for r in missing:
+        title = r["title"] or f"@{r['req_username']}"
+        link = r["link"]
+        lines.append(f"• <a href=\"{link}\">{title}</a>")
+        kb_rows.append([InlineKeyboardButton(text=f"📎 {title}", url=link)])
+
+    text_out = "\n".join(lines) + "\n\n<i>После подписки напиши снова.</i>"
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows) if kb_rows else None
+
+    try:
+        await event.bot.send_message(chat.id, text_out,
+                                      reply_markup=kb,
+                                      disable_web_page_preview=True)
+    except Exception as e:
+        log.warning("Не смог отправить требование: %s", e)
+
+
+# ==========================================================
+# АНТИСПАМ — УДАЛЕНИЕ МГНОВЕННОЕ
+# ==========================================================
+class AntiSpamMiddleware(BaseMiddleware):
+    """
+    Сначала быстрые локальные проверки (ссылка/капс/флуд) — они не
+    требуют сети. Если триггер сработал — удаляем немедленно.
+    Только после удаления (или если триггеров нет) делаем проверки
+    через сеть (админ ли чата).
+    """
+
+    async def __call__(self, handler, event, data):
+        if not isinstance(event, Message):
+            return await handler(event, data)
+
+        chat = event.chat
+        if chat.type not in ("group", "supergroup"):
+            return await handler(event, data)
+
+        if _is_service_message(event):
+            return await handler(event, data)
+
+        user = event.from_user
+        if not user or user.is_bot:
+            return await handler(event, data)
+
+        if user.id == SUPER_ADMIN_ID:
+            return await handler(event, data)
+
+        text = event.text or event.caption or ""
+        if not text or text.startswith("/"):
+            return await handler(event, data)
+
+        # === 1. БЫСТРАЯ ЛОКАЛЬНАЯ ПРОВЕРКА ТРИГГЕРОВ ===
+        reason = None
+        if USERNAME_ONLY_REGEX.match(text.strip()):
+            pass
+        elif has_link(text):
+            reason = "ссылка"
+        if reason is None and is_caps(text):
+            reason = "капс"
+        if reason is None and is_flood(chat.id, user.id, text):
+            reason = "флуд"
+
+        if reason is None:
+            return await handler(event, data)
+
+        # === 2. ПРОВЕРКА НА АДМИНА (БЫСТРО ИЗ КЕША) ===
+        # Если кеш говорит, что это админ — не удаляем.
+        admin_flag = _cache_get(_ADMIN_CACHE, (chat.id, user.id),
+                                _ADMIN_CACHE_TTL)
+        if admin_flag is True:
+            return await handler(event, data)
+
+        # === 3. МГНОВЕННОЕ УДАЛЕНИЕ ===
         try:
             await event.bot.delete_message(chat.id, event.message_id)
-            log.info("Удалено сообщение %s от %s в чате %s",
-                     event.message_id, user.id, chat.id)
+            log.info("AntiSpam: удалено msg=%s user=%s chat=%s reason=%s",
+                     event.message_id, user.id, chat.id, reason)
         except TelegramForbiddenError as e:
-            log.error("НЕТ ПРАВА УДАЛЯТЬ в чате %s: %s. "
-                      "Сделай бота админом с правом 'Delete messages'.",
-                      chat.id, e)
+            log.error("AntiSpam: нет права удалять в %s: %s", chat.id, e)
         except TelegramBadRequest as e:
-            log.warning("Не смог удалить сообщение %s: %s",
+            log.warning("AntiSpam: не смог удалить %s: %s",
                         event.message_id, e)
         except Exception as e:
-            log.warning("Ошибка удаления: %s", e)
+            log.warning("AntiSpam: ошибка удаления: %s", e)
 
-        # Отвечаем с тегом
+        # === 4. ПАРАЛЛЕЛЬНО: проверка админа (обновление кеша) и
+        #               уведомление ===
         mention = user_mention(user)
-        lines = [f"{mention}, 🚫 <b>чтобы писать в этом чате, "
-                 f"нужно подписаться на:</b>\n"]
-        kb_rows = []
-        for r in missing:
-            title = r["title"] or f"@{r['req_username']}"
-            link = r["link"]
-            lines.append(f"• <a href=\"{link}\">{title}</a>")
-            kb_rows.append([InlineKeyboardButton(text=f"📎 {title}", url=link)])
+        if reason == "ссылка":
+            warn = f"{mention}, 🚫 ссылки в этом чате запрещены."
+        elif reason == "капс":
+            warn = f"{mention}, 🚫 не пиши капсом."
+        elif reason == "флуд":
+            warn = f"{mention}, 🚫 прекрати флудить."
+            # Мут — отдельная задача, чтобы не тормозить ответ
+            async def mute():
+                try:
+                    await event.bot.restrict_chat_member(
+                        chat.id, user.id,
+                        until_date=datetime.utcnow()
+                                   + timedelta(seconds=FLOOD_MUTE_SECONDS),
+                        can_send_messages=False,
+                    )
+                    clear_flood(chat.id, user.id)
+                except Exception as e:
+                    log.warning("AntiSpam: не смог замутить %s: %s",
+                                user.id, e)
+            asyncio.create_task(mute())
+            warn += f"\nТы заглушен на {FLOOD_MUTE_SECONDS // 60} мин."
+        else:
+            warn = f"{mention}, 🚫 сообщение удалено."
 
-        text_out = "\n".join(lines) + "\n\n<i>После подписки напиши снова.</i>"
-        kb = InlineKeyboardMarkup(inline_keyboard=kb_rows) if kb_rows else None
+        # Не ждём отправки предупреждения — шлём в фоне
+        async def notify():
+            try:
+                await event.bot.send_message(chat.id, warn)
+            except Exception as e:
+                log.warning("AntiSpam: не смог отправить предупреждение: %s", e)
 
-        try:
-            await event.bot.send_message(chat.id, text_out,
-                                          reply_markup=kb,
-                                          disable_web_page_preview=True)
-        except Exception as e:
-            log.warning("Не смог отправить требование подписки: %s", e)
+        asyncio.create_task(notify())
 
-        # Не пропускаем дальше — сообщение уже удалено
+        # Обновляем кеш админов в фоне (на случай, если юзер — админ,
+        # а кеш был пуст)
+        if _cache_get(_ADMIN_CACHE, (chat.id, user.id),
+                       _ADMIN_CACHE_TTL) is None:
+            asyncio.create_task(is_chat_admin(event.bot, chat.id, user.id))
+
+        # Не пропускаем дальше
         return
 
 
@@ -849,22 +1164,11 @@ router_group.message.outer_middleware(AutoRegisterMiddleware())
 router_group.callback_query.outer_middleware(AutoRegisterMiddleware())
 router_group.chat_member.outer_middleware(AutoRegisterMiddleware())
 
-# Гейт — только на router_group.message
+# Порядок: сначала антиспам (локальные триггеры → мгновенное удаление),
+# потом гейт подписки. Так мгновенно удаляются ссылки/капс/флуд,
+# а подписка проверяется уже после.
+router_group.message.outer_middleware(AntiSpamMiddleware())
 router_group.message.outer_middleware(SubscriptionGateMiddleware())
-
-
-# ==========================================================
-# ХЕЛПЕР
-# ==========================================================
-async def is_chat_admin(bot: Bot, chat_id: int, user_id: int) -> bool:
-    if user_id == SUPER_ADMIN_ID:
-        return True
-    try:
-        m = await bot.get_chat_member(chat_id, user_id)
-        return m.status in (ChatMemberStatus.CREATOR,
-                             ChatMemberStatus.ADMINISTRATOR)
-    except Exception:
-        return False
 
 
 # ---------------- USER ----------------
@@ -970,7 +1274,6 @@ async def appeal_evidence(message: Message, state: FSMContext, bot: Bot):
 
 
 # ---------------- GROUP ----------------
-
 @router_group.message(Command("addgroup"), IsGroupChat())
 async def cmd_addgroup(message: Message, bot: Bot):
     if not await is_chat_admin(bot, message.chat.id, message.from_user.id):
@@ -1156,6 +1459,9 @@ async def on_chat_member(event: ChatMemberUpdated, bot: Bot):
     new = event.new_chat_member
     old = event.old_chat_member
 
+    # Инвалидируем кеш админов для этого чата
+    invalidate_admin_cache(event.chat.id)
+
     if old.status in ("left", "kicked") and new.status in ("member", "administrator"):
         u = new.user
         if u.username:
@@ -1188,6 +1494,7 @@ async def bot_added(event: ChatMemberUpdated, bot: Bot):
     if event.new_chat_member.status in ("member", "administrator"):
         await register_chat(event.chat.id,
                             event.chat.title or str(event.chat.id))
+        invalidate_admin_cache(event.chat.id)
         try:
             text = (
                 f"👋 Привет! Я бот-помощник этого чата.\n\n"
