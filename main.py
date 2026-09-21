@@ -58,7 +58,6 @@ os.makedirs(TEMPLATES_CACHE_DIR, exist_ok=True)
 BOT_NAME = "Скам база XkeyO"
 MAX_CAPTION = 1024
 
-# Рантайм-кэш ID, вычисленных по URL
 RESOLVED_LOG_ID = LOG_GROUP_ID
 RESOLVED_EVIDENCE_ID = EVIDENCE_GROUP_ID
 
@@ -222,13 +221,13 @@ def message_fingerprint(message):
     if message.contact:
         return "contact:" + (message.contact.phone_number or "")
     if message.location:
-        return f"loc:{message.location.latitude}:{message.location.longitude}"
+        return "loc:{}:{}".format(message.location.latitude, message.location.longitude)
     if message.venue:
-        return f"venue:{message.venue.title}"
+        return "venue:" + message.venue.title
     if message.poll:
-        return f"poll:{message.poll.question}"
+        return "poll:" + message.poll.question
     if message.dice:
-        return f"dice:{message.dice.emoji}:{message.dice.value}"
+        return "dice:{}:{}".format(message.dice.emoji, message.dice.value)
     return "unknown"
 
 
@@ -255,6 +254,20 @@ def is_command(message):
         if ent.type == "bot_command" and ent.offset == 0:
             return True
     return False
+
+
+# ==========================================================
+# БЕЗОПАСНЫЙ ОТВЕТ НА CALLBACK
+# ==========================================================
+async def safe_answer(cb: CallbackQuery, text: str = None, alert: bool = False):
+    """Никогда не падает, даже если колбэк протух."""
+    try:
+        if text:
+            await cb.answer(text, show_alert=alert)
+        else:
+            await cb.answer()
+    except TelegramBadRequest as e:
+        log.debug("safe_answer: %s", e)
 
 
 # ==========================================================
@@ -402,7 +415,6 @@ async def init_db():
             added_by     INTEGER
         )
         """)
-        # Жалобы — теперь только из бота
         await db.execute("""
         CREATE TABLE IF NOT EXISTS reports (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -416,15 +428,14 @@ async def init_db():
             created_at   TEXT
         )
         """)
-        # Переписка в рамках жалобы/апелляции
         await db.execute("""
         CREATE TABLE IF NOT EXISTS conversations (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            kind         TEXT NOT NULL,   -- 'report' | 'appeal'
+            kind         TEXT NOT NULL,
             ref_id       INTEGER NOT NULL,
             user_id      INTEGER NOT NULL,
             moderator_id INTEGER,
-            status       TEXT DEFAULT 'open', -- open, closed
+            status       TEXT DEFAULT 'open',
             created_at   TEXT
         )
         """)
@@ -441,7 +452,102 @@ async def init_db():
         )
         """)
         await db.commit()
+
+        # Применяем миграции для существующих баз
+        await _migrate_db(db)
+
     log.info("База данных готова: %s", DB_PATH)
+
+
+async def _table_columns(db, table_name):
+    """Возвращает множество имён колонок таблицы."""
+    cur = await db.execute("PRAGMA table_info({})".format(table_name))
+    rows = await cur.fetchall()
+    # row[1] — имя колонки
+    return {row[1] for row in rows}
+
+
+async def _add_column_if_missing(db, table, column, definition):
+    cols = await _table_columns(db, table)
+    if column not in cols:
+        log.info("Миграция: добавляю %s.%s (%s)", table, column, definition)
+        await db.execute(
+            "ALTER TABLE {} ADD COLUMN {} {}".format(table, column, definition)
+        )
+
+
+async def _migrate_db(db):
+    """
+    Добавляет отсутствующие колонки в существующие таблицы.
+    Безопасно: если колонка есть — просто пропускает.
+    Данные не теряются.
+    """
+    # === users ===
+    await _add_column_if_missing(db, "users", "username", "TEXT")
+    await _add_column_if_missing(db, "users", "full_name", "TEXT")
+    await _add_column_if_missing(db, "users", "status", "TEXT DEFAULT 'normal'")
+    await _add_column_if_missing(db, "users", "role", "TEXT DEFAULT 'user'")
+    await _add_column_if_missing(db, "users", "reason", "TEXT")
+    await _add_column_if_missing(db, "users", "evidence_url", "TEXT")
+    await _add_column_if_missing(db, "users", "updated_at", "TEXT")
+
+    # === appeals ===
+    await _add_column_if_missing(db, "appeals", "user_id", "INTEGER")
+    await _add_column_if_missing(db, "appeals", "text", "TEXT")
+    await _add_column_if_missing(db, "appeals", "photo_id", "TEXT")
+    await _add_column_if_missing(db, "appeals", "video_id", "TEXT")
+    await _add_column_if_missing(db, "appeals", "status", "TEXT DEFAULT 'pending'")
+    await _add_column_if_missing(db, "appeals", "handled_by", "INTEGER")
+    await _add_column_if_missing(db, "appeals", "created_at", "TEXT")
+
+    # === reports ===
+    await _add_column_if_missing(db, "reports", "reporter_id", "INTEGER")
+    await _add_column_if_missing(db, "reports", "target_id", "INTEGER")
+    await _add_column_if_missing(db, "reports", "text", "TEXT")
+    await _add_column_if_missing(db, "reports", "photo_id", "TEXT")
+    await _add_column_if_missing(db, "reports", "video_id", "TEXT")
+    await _add_column_if_missing(db, "reports", "status", "TEXT DEFAULT 'pending'")
+    await _add_column_if_missing(db, "reports", "handled_by", "INTEGER")
+    await _add_column_if_missing(db, "reports", "created_at", "TEXT")
+
+    # === chat_settings ===
+    await _add_column_if_missing(db, "chat_settings", "welcome_text", "TEXT")
+    await _add_column_if_missing(db, "chat_settings", "welcome_enabled", "INTEGER DEFAULT 1")
+    await _add_column_if_missing(db, "chat_settings", "updated_at", "TEXT")
+
+    # === required_chats ===
+    await _add_column_if_missing(db, "required_chats", "chat_id", "INTEGER")
+    await _add_column_if_missing(db, "required_chats", "req_chat_id", "INTEGER")
+    await _add_column_if_missing(db, "required_chats", "req_username", "TEXT")
+    await _add_column_if_missing(db, "required_chats", "title", "TEXT")
+    await _add_column_if_missing(db, "required_chats", "link", "TEXT")
+    await _add_column_if_missing(db, "required_chats", "expire_at", "TEXT")
+    await _add_column_if_missing(db, "required_chats", "added_at", "TEXT")
+    await _add_column_if_missing(db, "required_chats", "added_by", "INTEGER")
+
+    # === conversations ===
+    await _add_column_if_missing(db, "conversations", "kind", "TEXT")
+    await _add_column_if_missing(db, "conversations", "ref_id", "INTEGER")
+    await _add_column_if_missing(db, "conversations", "user_id", "INTEGER")
+    await _add_column_if_missing(db, "conversations", "moderator_id", "INTEGER")
+    await _add_column_if_missing(db, "conversations", "status", "TEXT DEFAULT 'open'")
+    await _add_column_if_missing(db, "conversations", "created_at", "TEXT")
+
+    # === conv_messages ===
+    await _add_column_if_missing(db, "conv_messages", "conv_id", "INTEGER")
+    await _add_column_if_missing(db, "conv_messages", "from_id", "INTEGER")
+    await _add_column_if_missing(db, "conv_messages", "is_mod", "INTEGER DEFAULT 0")
+    await _add_column_if_missing(db, "conv_messages", "text", "TEXT")
+    await _add_column_if_missing(db, "conv_messages", "photo_id", "TEXT")
+    await _add_column_if_missing(db, "conv_messages", "video_id", "TEXT")
+    await _add_column_if_missing(db, "conv_messages", "created_at", "TEXT")
+
+    # Обновим существующих юзеров: если role NULL — поставим 'user'
+    await db.execute("UPDATE users SET role='user' WHERE role IS NULL")
+    # Главному админу — super
+    await db.execute("UPDATE users SET role='super' WHERE user_id=?",
+                     (SUPER_ADMIN_ID,))
+    await db.commit()
 
 
 # ---------- USERS ----------
@@ -450,7 +556,7 @@ async def upsert_user(user_id, username=None, full_name=None):
         db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT role FROM users WHERE user_id=?", (user_id,))
         existing = await cur.fetchone()
-        if existing:
+        if existing and existing["role"]:
             role = existing["role"]
             if user_id == SUPER_ADMIN_ID:
                 role = ROLE_SUPER
@@ -508,7 +614,6 @@ async def set_user_role(user_id, role):
 
 
 async def list_staff():
-    """Все super+admin+moderator."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
@@ -661,7 +766,6 @@ async def log_action(admin_id, action, target_id=None, payload=None):
 
 
 async def _resolve_group_id(bot: Bot, url_or_id, current):
-    """Пытается получить chat_id по ссылке-юзернейму (t.me/name)."""
     if current:
         return current
     if not url_or_id:
@@ -671,7 +775,7 @@ async def _resolve_group_id(bot: Bot, url_or_id, current):
         return None
     username = m.group(1)
     try:
-        chat = await bot.get_chat(f"@{username}")
+        chat = await bot.get_chat("@" + username)
         return chat.id
     except Exception as e:
         log.warning("Не смог получить chat_id по %s: %s", username, e)
@@ -692,7 +796,6 @@ async def send_log(bot: Bot, text: str):
 
 
 async def send_evidence(bot: Bot, report: dict, target: dict, status: str):
-    """Отправляет доказательства в канал доказательств."""
     global RESOLVED_EVIDENCE_ID
     if not RESOLVED_EVIDENCE_ID:
         RESOLVED_EVIDENCE_ID = await _resolve_group_id(bot, EVIDENCE_GROUP_URL, None)
@@ -705,18 +808,18 @@ async def send_evidence(bot: Bot, report: dict, target: dict, status: str):
     full_name = target.get("full_name") or "—"
 
     if username:
-        profile_link = f"https://t.me/{username}"
+        profile_link = "https://t.me/" + username
     else:
-        profile_link = f"tg://user?id={tid}"
+        profile_link = "tg://user?id={}".format(tid)
 
     header = (
-        f"{STATUS_LABELS[status]}\n"
-        f"👤 Имя: <b>{full_name}</b>\n"
-        f"🆔 ID: <code>{tid}</code>\n"
-        f"🔗 Юзернейм: @{username or '—'}\n"
-        f"👤 Профиль: <a href=\"{profile_link}\">открыть</a>\n"
-        f"📝 Жалоба от: <code>{report.get('reporter_id')}</code>\n"
-        f"💬 Текст: {report.get('text') or '—'}"
+        STATUS_LABELS[status] + "\n"
+        "👤 Имя: <b>" + str(full_name) + "</b>\n"
+        "🆔 ID: <code>" + str(tid) + "</code>\n"
+        "🔗 Юзернейм: @" + (username or "—") + "\n"
+        "👤 Профиль: <a href=\"" + profile_link + "\">открыть</a>\n"
+        "📝 Жалоба от: <code>" + str(report.get("reporter_id")) + "</code>\n"
+        "💬 Текст: " + (report.get("text") or "—")
     )
 
     try:
@@ -880,26 +983,26 @@ def parse_link(raw):
     raw = raw.strip()
     if raw.startswith("@"):
         username = raw[1:]
-        return username, f"https://t.me/{username}"
+        return username, "https://t.me/" + username
     m = re.fullmatch(r"(?:https?://)?t\.me/([A-Za-z0-9_]+)/?", raw)
     if m:
         username = m.group(1)
-        return username, f"https://t.me/{username}"
+        return username, "https://t.me/" + username
     return None, None
 
 
 async def get_chat_title(bot, username):
     try:
-        chat = await bot.get_chat(f"@{username}")
-        return chat.title or chat.full_name or f"@{username}"
+        chat = await bot.get_chat("@" + username)
+        return chat.title or chat.full_name or ("@" + username)
     except Exception:
-        return f"@{username}"
+        return "@" + username
 
 
 async def is_user_subscribed(bot, user_id, req):
     try:
         member = await bot.get_chat_member(
-            req["req_chat_id"] or f"@{req['req_username']}", user_id)
+            req["req_chat_id"] or ("@" + req["req_username"]), user_id)
         return member.status in (ChatMemberStatus.CREATOR,
                                   ChatMemberStatus.ADMINISTRATOR,
                                   ChatMemberStatus.MEMBER)
@@ -923,16 +1026,16 @@ async def check_user_all_subscriptions(bot, user_id, chat_id):
 
 def user_mention(user):
     if user.username:
-        return f"@{user.username}"
-    return f'<a href="tg://user?id={user.id}">{user.full_name}</a>'
+        return "@" + user.username
+    return "<a href=\"tg://user?id=" + str(user.id) + "\">" + str(user.full_name) + "</a>"
 
 
 def user_mention_by_id(user_id, username=None, full_name=None):
     if username:
-        return f"@{username}"
+        return "@" + username
     if full_name:
-        return f'<a href="tg://user?id={user_id}">{full_name}</a>'
-    return f'<a href="tg://user?id={user_id}">ID {user_id}</a>'
+        return "<a href=\"tg://user?id=" + str(user_id) + "\">" + str(full_name) + "</a>"
+    return "<a href=\"tg://user?id=" + str(user_id) + "\">ID " + str(user_id) + "</a>"
 
 
 async def is_chat_admin(bot, chat_id, user_id):
@@ -958,7 +1061,7 @@ async def send_photo_cached(
     bot_or_message, chat_id, img_name, caption,
     reply_markup=None, reply_to_message_id=None, cache_prefix="img",
 ):
-    cache_key = f"{cache_prefix}:{img_name}"
+    cache_key = cache_prefix + ":" + img_name
     safe_caption = _cut_caption(caption)
 
     kwargs = {}
@@ -1014,16 +1117,16 @@ async def send_status_card(target, user_data, extra_text="", reply_to=None):
     img_name = STATUS_IMAGES.get(status, IMAGE_NORMAL_FALLBACK)
 
     text = (
-        f"📇 <b>Карточка</b>\n"
-        f"ID: <code>{user_data.get('user_id', '—')}</code>\n"
-        f"Имя: {user_data.get('full_name') or '—'}\n"
-        f"Юзернейм: @{user_data.get('username') or '—'}\n"
-        f"Статус: {label}\n"
+        "📇 <b>Карточка</b>\n"
+        "ID: <code>" + str(user_data.get("user_id", "—")) + "</code>\n"
+        "Имя: " + (user_data.get("full_name") or "—") + "\n"
+        "Юзернейм: @" + (user_data.get("username") or "—") + "\n"
+        "Статус: " + label + "\n"
     )
     if user_data.get("reason"):
-        text += f"Причина: {user_data['reason']}\n"
+        text += "Причина: " + user_data["reason"] + "\n"
     if extra_text:
-        text += f"\n{extra_text}"
+        text += "\n" + extra_text
 
     kb = profile_kb(user_data.get("user_id") or 0,
                     user_data.get("evidence_url"),
@@ -1144,13 +1247,12 @@ class SubscriptionGateMiddleware(BaseMiddleware):
             log.warning("Gate: не смог удалить: %s", e)
 
         mention = user_mention(user)
-        lines = [f"{mention}, 🚫 <b>чтобы писать в этом чате, "
-                 f"нужно подписаться на:</b>\n"]
+        lines = [mention + ", 🚫 <b>чтобы писать в этом чате, нужно подписаться на:</b>\n"]
         kb_rows = []
         for r in missing:
-            title = r["title"] or f"@{r['req_username']}"
-            lines.append(f"• <a href=\"{r['link']}\">{title}</a>")
-            kb_rows.append([InlineKeyboardButton(text=f"📎 {title}", url=r["link"])])
+            title = r["title"] or ("@" + r["req_username"])
+            lines.append("• <a href=\"" + r["link"] + "\">" + title + "</a>")
+            kb_rows.append([InlineKeyboardButton(text="📎 " + title, url=r["link"])])
         text_out = "\n".join(lines) + "\n\n<i>После подписки напиши снова.</i>"
         kb = InlineKeyboardMarkup(inline_keyboard=kb_rows) if kb_rows else None
         try:
@@ -1213,11 +1315,11 @@ class AntiSpamMiddleware(BaseMiddleware):
 
         mention = user_mention(user)
         if reason == "ссылка":
-            warn = f"{mention}, 🚫 ссылки запрещены."
+            warn = mention + ", 🚫 ссылки запрещены."
         elif reason == "капс":
-            warn = f"{mention}, 🚫 не пиши капсом."
+            warn = mention + ", 🚫 не пиши капсом."
         elif reason == "флуд":
-            warn = f"{mention}, 🚫 прекрати флудить."
+            warn = mention + ", 🚫 прекрати флудить."
             async def mute():
                 try:
                     await event.bot.restrict_chat_member(
@@ -1228,9 +1330,9 @@ class AntiSpamMiddleware(BaseMiddleware):
                 except Exception:
                     pass
             asyncio.create_task(mute())
-            warn += f"\nЗаглушен на {FLOOD_MUTE_SECONDS // 60} мин."
+            warn += "\nЗаглушен на " + str(FLOOD_MUTE_SECONDS // 60) + " мин."
         else:
-            warn = f"{mention}, 🚫 сообщение удалено."
+            warn = mention + ", 🚫 сообщение удалено."
         try:
             await event.bot.send_message(chat.id, warn)
         except Exception:
@@ -1251,15 +1353,11 @@ def user_menu():
 
 def staff_menu(role: str):
     rows = [
-        [InlineKeyboardButton(text="📨 Жалобы в обработке",
-                              callback_data="staff:reports")],
+        [InlineKeyboardButton(text="📨 Жалобы", callback_data="staff:reports")],
         [InlineKeyboardButton(text="⚖️ Апелляции", callback_data="staff:appeals")],
-        [InlineKeyboardButton(text="➕ Изменить статус",
-                              callback_data="admin_set_status")],
-        [InlineKeyboardButton(text="⛔ Забанить везде",
-                              callback_data="admin_ban_anywhere")],
-        [InlineKeyboardButton(text="🔁 Сбросить статус",
-                              callback_data="admin_reset_status")],
+        [InlineKeyboardButton(text="➕ Изменить статус", callback_data="admin_set_status")],
+        [InlineKeyboardButton(text="⛔ Забанить везде", callback_data="admin_ban_anywhere")],
+        [InlineKeyboardButton(text="🔁 Сбросить статус", callback_data="admin_reset_status")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
     ]
     if role in (ROLE_SUPER, ROLE_ADMIN):
@@ -1286,19 +1384,19 @@ def roles_menu(actor_role: str):
 def status_choice_kb(prefix):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=STATUS_LABELS[STATUS_SCAM],
-                              callback_data=f"{prefix}:{STATUS_SCAM}")],
+                              callback_data=prefix + ":" + STATUS_SCAM)],
         [InlineKeyboardButton(text=STATUS_LABELS[STATUS_SUSPICIOUS],
-                              callback_data=f"{prefix}:{STATUS_SUSPICIOUS}")],
+                              callback_data=prefix + ":" + STATUS_SUSPICIOUS)],
         [InlineKeyboardButton(text=STATUS_LABELS[STATUS_NORMAL],
-                              callback_data=f"{prefix}:{STATUS_NORMAL}")],
+                              callback_data=prefix + ":" + STATUS_NORMAL)],
         [InlineKeyboardButton(text=STATUS_LABELS[STATUS_VERIFIED],
-                              callback_data=f"{prefix}:{STATUS_VERIFIED}")],
+                              callback_data=prefix + ":" + STATUS_VERIFIED)],
     ])
 
 
 def profile_kb(user_id, evidence_url, username):
     rows = []
-    link = f"https://t.me/{username}" if username else f"tg://user?id={user_id}"
+    link = ("https://t.me/" + username) if username else ("tg://user?id=" + str(user_id))
     rows.append([InlineKeyboardButton(text="👤 Открыть профиль", url=link)])
     if evidence_url:
         rows.append([InlineKeyboardButton(text="📎 Доказательства", url=evidence_url)])
@@ -1306,43 +1404,75 @@ def profile_kb(user_id, evidence_url, username):
 
 
 def report_review_kb(report_id):
-    """Кнопки для модератора по конкретной жалобе."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Принять",
-                              callback_data=f"report_accept:{report_id}")],
+                              callback_data="report_accept:" + str(report_id))],
         [InlineKeyboardButton(text="❌ Отклонить",
-                              callback_data=f"report_reject:{report_id}")],
+                              callback_data="report_reject:" + str(report_id))],
         [InlineKeyboardButton(text="💬 Написать автору",
-                              callback_data=f"report_msg:{report_id}")],
+                              callback_data="report_msg:" + str(report_id))],
+    ])
+
+
+def report_status_kb(report_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=STATUS_LABELS[STATUS_SCAM],
+                              callback_data="report_apply:{}:{}".format(report_id, STATUS_SCAM))],
+        [InlineKeyboardButton(text=STATUS_LABELS[STATUS_SUSPICIOUS],
+                              callback_data="report_apply:{}:{}".format(report_id, STATUS_SUSPICIOUS))],
+        [InlineKeyboardButton(text=STATUS_LABELS[STATUS_NORMAL],
+                              callback_data="report_apply:{}:{}".format(report_id, STATUS_NORMAL))],
+        [InlineKeyboardButton(text=STATUS_LABELS[STATUS_VERIFIED],
+                              callback_data="report_apply:{}:{}".format(report_id, STATUS_VERIFIED))],
     ])
 
 
 def appeal_review_kb(appeal_id):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Поменять решение",
-                              callback_data=f"appeal_change:{appeal_id}")],
+                              callback_data="appeal_change:" + str(appeal_id))],
         [InlineKeyboardButton(text="❌ Отказать",
-                              callback_data=f"appeal_reject:{appeal_id}")],
+                              callback_data="appeal_reject:" + str(appeal_id))],
         [InlineKeyboardButton(text="💬 Написать автору",
-                              callback_data=f"appeal_msg:{appeal_id}")],
+                              callback_data="appeal_msg:" + str(appeal_id))],
     ])
 
 
 def conv_reply_kb(kind, ref_id, user_id):
-    """Кнопка 'ответить' в уведомлении, которое приходит юзеру."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✍️ Ответить",
-                              callback_data=f"conv_reply:{kind}:{ref_id}")],
+                              callback_data="conv_reply:{}:{}".format(kind, ref_id))],
     ])
 
 
 def conv_staff_reply_kb(kind, ref_id, conv_id):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✍️ Ответить",
-                              callback_data=f"conv_staff_reply:{conv_id}")],
+                              callback_data="conv_staff_reply:" + str(conv_id))],
         [InlineKeyboardButton(text="🔒 Закрыть диалог",
-                              callback_data=f"conv_close:{conv_id}")],
+                              callback_data="conv_close:" + str(conv_id))],
     ])
+
+
+def settings_menu(chat_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Приветствие",
+                              callback_data="settings:welcome:" + str(chat_id))],
+        [InlineKeyboardButton(text="🔒 Добавить подписку",
+                              callback_data="settings:required:" + str(chat_id))],
+        [InlineKeyboardButton(text="📋 Список подписок",
+                              callback_data="settings:list:" + str(chat_id))],
+    ])
+
+
+def remgroup_kb(chat_id, reqs):
+    rows = []
+    for r in reqs:
+        title = r["title"] or ("@" + r["req_username"])
+        rows.append([InlineKeyboardButton(
+            text=("🗑 " + title)[:60],
+            callback_data="remgroup:{}:{}".format(chat_id, r["id"]))])
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
 
 # ==========================================================
@@ -1357,8 +1487,8 @@ class AppealFSM(StatesGroup):
 
 
 class ConvFSM(StatesGroup):
-    waiting_message = State()      # юзер пишет модератору
-    waiting_staff_message = State()  # модератор пишет юзеру
+    waiting_message = State()
+    waiting_staff_message = State()
 
 
 class StaffFSM(StatesGroup):
@@ -1406,16 +1536,13 @@ async def role_can_assign(actor_role, target_role):
     return False
 
 
-async def broadcast_staff(bot: Bot, text: str, kb=None,
-                           exclude_id: int = None):
-    """Рассылает всем super/admin/moderator (кроме указанного)."""
+async def broadcast_staff(bot: Bot, text: str, kb=None, exclude_id: int = None):
     for row in await list_staff():
         uid = row["user_id"]
         if exclude_id and uid == exclude_id:
             continue
         try:
-            await bot.send_message(uid, text,
-                                    reply_markup=kb,
+            await bot.send_message(uid, text, reply_markup=kb,
                                     disable_web_page_preview=True)
         except Exception:
             pass
@@ -1431,23 +1558,23 @@ async def user_start(message: Message, state: FSMContext, bot: Bot):
 
     if role in (ROLE_SUPER, ROLE_ADMIN, ROLE_MODERATOR):
         await message.answer(
-            f"👋 <b>{BOT_NAME}</b>\nРоль: {ROLE_LABELS[role]}\n\n"
-            f"Команды:\n"
-            f"/admin — панель управления\n"
-            f"/roles — управление ролями (только super/admin)"
+            "👋 <b>" + BOT_NAME + "</b>\n"
+            "Роль: " + ROLE_LABELS[role] + "\n\n"
+            "/admin — панель управления\n"
+            "/roles — управление ролями (super/admin)"
         )
         return
 
     text = (
-        f"👋 Привет! Это <b>{BOT_NAME}</b>.\n\n"
+        "👋 Привет! Это <b>" + BOT_NAME + "</b>.\n\n"
         "Я помогаю собирать информацию о скамерах и проверять пользователей.\n\n"
         "📌 Что я умею:\n"
-        "• 🚨 <b>Пожаловаться</b> на пользователя прямо здесь, в боте\n"
+        "• 🚨 <b>Пожаловаться</b> на пользователя прямо здесь\n"
         "• 🔎 Проверить свой статус\n"
         "• ⚖️ Обжаловать решение модератора\n"
         "• В группе: <code>/check</code>, <code>/report</code>, "
         "<code>/settings</code> (админ группы)\n\n"
-        "Жалобы рассматривают модераторы. Они могут ответить тебе прямо в боте."
+        "Жалобы рассматривают модераторы. Они могут ответить тебе в боте."
     )
     await send_photo_cached(message, None, IMAGE_START, text,
                             reply_markup=user_menu(),
@@ -1461,46 +1588,41 @@ async def check_me(cb: CallbackQuery):
         await upsert_user(cb.from_user.id, cb.from_user.username,
                           cb.from_user.full_name)
         u = await get_user(cb.from_user.id)
+    await safe_answer(cb)
     await send_status_card(cb.message, u)
-    await cb.answer()
 
 
 # ==========================================================
-# USER: ЖАЛОБА через бота
+# USER: ЖАЛОБА
 # ==========================================================
 @router_user.callback_query(F.data == "report_start", IsPrivateChat())
 async def report_start(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
     await state.set_state(ReportFSM.waiting_evidence)
     await cb.message.answer(
         "🚨 <b>Жалоба</b>\n\n"
         "Отправь одним сообщением:\n"
-        "1️⃣ Кому жалоба (ID, @username или ссылку на профиль)\n"
+        "1️⃣ ID или @username нарушителя\n"
         "2️⃣ Описание и доказательства (текст/фото/видео)\n\n"
-        "Пример: <code>@scammer123 123456789 — кинул на 5000р</code>\n"
-        "Если нужен только ID: <code>123456789 описание...</code>"
+        "Пример: <code>@scammer123 123456789 — кинул на 5000р</code>"
     )
-    await cb.answer()
 
 
 def _extract_target_and_text(raw: str):
-    """Возвращает (target_id_or_None, target_username_or_None, rest_text)."""
     target_id = None
     target_username = None
     rest = raw
 
-    # ищем @username
     m = re.search(r"@([A-Za-z0-9_]{5,32})", raw)
     if m:
         target_username = m.group(1)
         rest = raw.replace(m.group(0), "", 1).strip()
 
-    # ищем ID (5+ цифр)
     m2 = re.search(r"\b(\d{5,})\b", rest)
     if m2:
         target_id = int(m2.group(1))
         rest = rest.replace(m2.group(1), "", 1).strip()
 
-    # убираем лишние запятые/тире в начале
     rest = re.sub(r"^[,\-\s]+", "", rest)
     return target_id, target_username, rest
 
@@ -1519,47 +1641,46 @@ async def report_evidence(message: Message, state: FSMContext, bot: Bot):
             target_id = found["user_id"]
         else:
             await message.answer(
-                f"❗ Пользователь @{target_username} ещё не в базе.\n\n"
-                f"Укажи его ID вручную: <code>{target_username} 123456789 описание</code>"
+                "❗ @" + target_username + " ещё не в базе.\n"
+                "Укажи его ID: <code>" + target_username + " 123456789 описание</code>"
             )
             return
     if target_id is None:
         await message.answer(
-            "❗ Не понял, на кого жалоба.\n"
-            "Укажи ID или @username в начале сообщения."
+            "❗ Не понял, на кого жалоба. Укажи ID или @username в начале."
         )
         return
-
     if target_id == message.from_user.id:
         await message.answer("Нельзя жаловаться на себя.")
         return
 
     await upsert_user(target_id, target_username, None)
-
     report_id = await add_report(message.from_user.id, target_id,
                                   rest, photo_id, video_id)
-
-    # Создаём диалог
-    conv_id = await create_conversation("report", report_id, message.from_user.id)
+    await create_conversation("report", report_id, message.from_user.id)
 
     target_user = await get_user(target_id) or {}
+    target_mention = user_mention_by_id(
+        target_id,
+        target_user.get("username"),
+        target_user.get("full_name"),
+    )
+    from_mention = user_mention(message.from_user)
 
     header = (
-        f"🚨 <b>Жалоба #{report_id}</b>\n\n"
-        f"👤 От: {user_mention(message.from_user)}\n"
-        f"🎯 На: {user_mention_by_id(target_id, target_user.get('username'),
-                                     target_user.get('full_name'))}\n"
-        f"🆔 ID цели: <code>{target_id}</code>\n\n"
-        f"📝 Текст: {rest or '—'}"
+        "🚨 <b>Жалоба #" + str(report_id) + "</b>\n\n"
+        "👤 От: " + from_mention + "\n"
+        "🎯 На: " + target_mention + "\n"
+        "🆔 ID цели: <code>" + str(target_id) + "</code>\n\n"
+        "📝 Текст: " + (rest or "—")
     )
 
     await broadcast_staff(bot, header, kb=report_review_kb(report_id),
                            exclude_id=message.from_user.id)
-
     await send_log(bot,
-        f"🚨 Жалоба #{report_id}\n"
-        f"От: <code>{message.from_user.id}</code>\n"
-        f"На: <code>{target_id}</code>")
+        "🚨 Жалоба #" + str(report_id) +
+        " от <code>" + str(message.from_user.id) + "</code>" +
+        " на <code>" + str(target_id) + "</code>")
 
     await state.clear()
     await message.answer(
@@ -1573,13 +1694,12 @@ async def report_evidence(message: Message, state: FSMContext, bot: Bot):
 # ==========================================================
 @router_user.callback_query(F.data == "appeal_start", IsPrivateChat())
 async def appeal_start(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
     await state.set_state(AppealFSM.waiting_evidence)
     await cb.message.answer(
         "⚖️ <b>Обжалование</b>\n\n"
-        "Отправь одним сообщением доказательства, почему решение неверно: "
-        "текст, фото или видео."
+        "Отправь одним сообщением доказательства: текст, фото или видео."
     )
-    await cb.answer()
 
 
 @router_user.message(AppealFSM.waiting_evidence, IsPrivateChat())
@@ -1589,22 +1709,24 @@ async def appeal_evidence(message: Message, state: FSMContext, bot: Bot):
     text = message.caption or message.text or ""
 
     appeal_id = await add_appeal(message.from_user.id, text, photo_id, video_id)
-    conv_id = await create_conversation("appeal", appeal_id, message.from_user.id)
+    await create_conversation("appeal", appeal_id, message.from_user.id)
 
+    from_mention = user_mention(message.from_user)
     header = (
-        f"⚖️ <b>Новая апелляция #{appeal_id}</b>\n"
-        f"От: {user_mention(message.from_user)}\n"
-        f"ID: <code>{message.from_user.id}</code>\n\n"
-        f"📝 Текст: {text or '—'}"
+        "⚖️ <b>Новая апелляция #" + str(appeal_id) + "</b>\n"
+        "От: " + from_mention + "\n"
+        "ID: <code>" + str(message.from_user.id) + "</code>\n\n"
+        "📝 Текст: " + (text or "—")
     )
     await broadcast_staff(bot, header, kb=appeal_review_kb(appeal_id))
-    await send_log(bot, f"⚖️ Апелляция #{appeal_id} от <code>{message.from_user.id}</code>")
+    await send_log(bot, "⚖️ Апелляция #" + str(appeal_id) +
+                        " от <code>" + str(message.from_user.id) + "</code>")
     await state.clear()
-    await message.answer("✅ Апелляция отправлена модераторам.")
+    await message.answer("✅ Апелляция отправлена.")
 
 
 # ==========================================================
-# USER: ДИАЛОГ С МОДЕРАТОРОМ (юзер пишет)
+# USER: ДИАЛОГ С МОДЕРАТОРОМ
 # ==========================================================
 @router_user.callback_query(F.data.startswith("conv_reply:"))
 async def conv_reply_user(cb: CallbackQuery, state: FSMContext):
@@ -1612,13 +1734,13 @@ async def conv_reply_user(cb: CallbackQuery, state: FSMContext):
     ref_id = int(ref_id_str)
     conv = await get_conversation_by_ref(kind, ref_id)
     if not conv or conv["status"] == "closed":
-        await cb.answer("Диалог закрыт", show_alert=True)
+        await safe_answer(cb, "Диалог закрыт", alert=True)
         return
+    await safe_answer(cb)
     await state.set_state(ConvFSM.waiting_message)
     await state.update_data(kind=kind, ref_id=ref_id,
                             conv_id=conv["id"], as_staff=False)
     await cb.message.answer("✍️ Напиши сообщение модератору:")
-    await cb.answer()
 
 
 @router_user.message(ConvFSM.waiting_message, IsPrivateChat())
@@ -1627,7 +1749,6 @@ async def conv_user_send(message: Message, state: FSMContext, bot: Bot):
     conv_id = data.get("conv_id")
     kind = data.get("kind")
     ref_id = data.get("ref_id")
-    as_staff = data.get("as_staff", False)
     if not conv_id:
         await state.clear()
         return
@@ -1642,16 +1763,14 @@ async def conv_user_send(message: Message, state: FSMContext, bot: Bot):
     video_id = message.video.file_id if message.video else None
     text = message.caption or message.text or ""
 
-    await add_conv_message(conv_id, message.from_user.id,
-                            is_mod=as_staff, text=text,
-                            photo_id=photo_id, video_id=video_id)
+    await add_conv_message(conv_id, message.from_user.id, is_mod=False,
+                            text=text, photo_id=photo_id, video_id=video_id)
 
-    # Уведомляем модератора, ведущего диалог
     mod_id = conv.get("moderator_id")
+    from_mention = user_mention(message.from_user)
     body = (
-        f"💬 <b>Сообщение по {kind} #{ref_id}</b>\n"
-        f"От: {user_mention(message.from_user)}\n\n"
-        f"{text or '—'}"
+        "💬 <b>Сообщение по " + kind + " #" + str(ref_id) + "</b>\n"
+        "От: " + from_mention + "\n\n" + (text or "—")
     )
     kb = conv_staff_reply_kb(kind, ref_id, conv_id)
 
@@ -1683,7 +1802,8 @@ async def admin_cmd(message: Message, state: FSMContext):
         return
     await state.clear()
     await message.answer(
-        f"🛠 <b>{BOT_NAME}</b> — панель\nРоль: {ROLE_LABELS[role]}",
+        "🛠 <b>" + BOT_NAME + "</b> — панель\n" +
+        "Роль: " + ROLE_LABELS[role],
         reply_markup=staff_menu(role)
     )
 
@@ -1695,20 +1815,18 @@ async def roles_cmd(message: Message, state: FSMContext):
         await message.answer("⛔ Нет доступа.")
         return
     await state.set_state(StaffFSM.waiting_role_target)
-    await message.answer(
-        "🎭 Введи @username или ID пользователя, которому хочешь выдать роль."
-    )
+    await message.answer("🎭 Введи @username или ID пользователя.")
 
 
 @router_staff.callback_query(F.data == "admin_roles")
 async def cb_admin_roles(cb: CallbackQuery, state: FSMContext):
     role = await get_user_role(cb.from_user.id)
     if role not in (ROLE_SUPER, ROLE_ADMIN):
-        await cb.answer("Нет доступа", show_alert=True)
+        await safe_answer(cb, "Нет доступа", alert=True)
         return
+    await safe_answer(cb)
     await state.set_state(StaffFSM.waiting_role_target)
     await cb.message.answer("🎭 Введи @username или ID.")
-    await cb.answer()
 
 
 @router_staff.message(StaffFSM.waiting_role_target, F.text, IsPrivateChat())
@@ -1732,7 +1850,7 @@ async def roles_set_target(message: Message, state: FSMContext):
         if found:
             target_id = found["user_id"]
         else:
-            await message.answer("❗ Пользователь не найден в базе.")
+            await message.answer("❗ Не найден в базе.")
             await state.clear()
             return
     if target_id is None:
@@ -1741,7 +1859,7 @@ async def roles_set_target(message: Message, state: FSMContext):
 
     await state.update_data(target_id=target_id)
     await message.answer(
-        f"Кому какую роль выдать для <code>{target_id}</code>?",
+        "Кому какую роль выдать для <code>" + str(target_id) + "</code>?",
         reply_markup=roles_menu(role)
     )
 
@@ -1753,20 +1871,21 @@ async def role_set_apply(cb: CallbackQuery, state: FSMContext, bot: Bot):
     data = await state.get_data()
     target_id = data.get("target_id")
     if not target_id:
-        await cb.answer("Потерян таргет", show_alert=True)
+        await safe_answer(cb, "Потерян таргет", alert=True)
         return
     if not await role_can_assign(actor_role, new_role):
-        await cb.answer("Недостаточно прав", show_alert=True)
+        await safe_answer(cb, "Недостаточно прав", alert=True)
         return
 
+    await safe_answer(cb)
     await set_user_role(target_id, new_role)
-    await log_action(cb.from_user.id, f"set_role:{new_role}", target_id)
+    await log_action(cb.from_user.id, "set_role:" + new_role, target_id)
+    actor_mention = user_mention(cb.from_user)
     await send_log(bot,
-        f"🎭 {user_mention(cb.from_user)} ({ROLE_LABELS[actor_role]}) выдал "
-        f"{ROLE_LABELS[new_role]} → <code>{target_id}</code>")
-    await cb.message.answer(f"✅ Роль: {ROLE_LABELS[new_role]}")
+        "🎭 " + actor_mention + " (" + ROLE_LABELS[actor_role] + ") выдал " +
+        ROLE_LABELS[new_role] + " → <code>" + str(target_id) + "</code>")
+    await cb.message.answer("✅ Роль: " + ROLE_LABELS[new_role])
     await state.clear()
-    await cb.answer()
 
 
 # ---- Жалобы: список ----
@@ -1774,192 +1893,190 @@ async def role_set_apply(cb: CallbackQuery, state: FSMContext, bot: Bot):
 async def cb_staff_reports(cb: CallbackQuery):
     role = await get_user_role(cb.from_user.id)
     if role not in (ROLE_SUPER, ROLE_ADMIN, ROLE_MODERATOR):
-        await cb.answer("Нет доступа", show_alert=True)
+        await safe_answer(cb, "Нет доступа", alert=True)
         return
+
+    await safe_answer(cb)
+
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
             "SELECT * FROM reports WHERE status='pending' ORDER BY id ASC LIMIT 10")
-        rows = await cur.fetchall()
+        rows = [dict(r) for r in await cur.fetchall()]
+
     if not rows:
         await cb.message.answer("📭 Нет новых жалоб.")
-        await cb.answer()
         return
+
     for r in rows:
-        r = dict(r)
         target_user = await get_user(r["target_id"]) or {}
+        target_mention = user_mention_by_id(
+            r["target_id"],
+            target_user.get("username"),
+            target_user.get("full_name"),
+        )
         body = (
-            f"🚨 <b>Жалоба #{r['id']}</b>\n"
-            f"От: <code>{r['reporter_id']}</code>\n"
-            f"На: {user_mention_by_id(r['target_id'], target_user.get('username'), target_user.get('full_name'))}\n"
-            f"Текст: {r.get('text') or '—'}"
+            "🚨 <b>Жалоба #" + str(r["id"]) + "</b>\n"
+            "От: <code>" + str(r["reporter_id"]) + "</code>\n"
+            "На: " + target_mention + "\n"
+            "Текст: " + (r.get("text") or "—")
         )
         kb = report_review_kb(r["id"])
-        if r.get("photo_id"):
-            await cb.message.answer_photo(r["photo_id"], caption=body, reply_markup=kb)
-        elif r.get("video_id"):
-            await cb.message.answer_video(r["video_id"], caption=body, reply_markup=kb)
-        else:
-            await cb.message.answer(body, reply_markup=kb)
-    await cb.answer()
+        try:
+            if r.get("photo_id"):
+                await cb.message.answer_photo(r["photo_id"], caption=body,
+                                               reply_markup=kb)
+            elif r.get("video_id"):
+                await cb.message.answer_video(r["video_id"], caption=body,
+                                               reply_markup=kb)
+            else:
+                await cb.message.answer(body, reply_markup=kb)
+        except TelegramBadRequest as e:
+            log.warning("reports item: %s", e)
 
 
-# ---- Жалобы: принять/отклонить/написать ----
+# ---- Жалобы: принять ----
 @router_staff.callback_query(F.data.startswith("report_accept:"))
 async def report_accept(cb: CallbackQuery, bot: Bot):
     role = await get_user_role(cb.from_user.id)
     if not await role_can_set_status(role):
-        await cb.answer("Нет доступа", show_alert=True)
+        await safe_answer(cb, "Нет доступа", alert=True)
         return
+
     report_id = int(cb.data.split(":")[1])
     rep = await get_report(report_id)
     if not rep:
-        await cb.answer("Жалоба не найдена", show_alert=True)
+        await safe_answer(cb, "Жалоба не найдена", alert=True)
         return
     if rep["status"] != "pending":
-        await cb.answer("Уже обработана", show_alert=True)
+        await safe_answer(cb, "Уже обработана", alert=True)
         return
 
-    # Захват диалога
     conv = await get_conversation_by_ref("report", report_id)
     if conv and not await claim_conversation(conv["id"], cb.from_user.id):
-        await cb.answer("Диалог уже ведёт другой модератор", show_alert=True)
+        await safe_answer(cb, "Диалог ведёт другой модератор", alert=True)
         return
+
+    await safe_answer(cb, "Принято")
 
     await set_report_status(report_id, "accepted", cb.from_user.id)
     await log_action(cb.from_user.id, "report_accept", rep["target_id"],
-                     f"report={report_id}")
+                     "report=" + str(report_id))
 
-    # Просим модератора выбрать статус
     await cb.message.answer(
         "✅ Жалоба принята. Выбери статус для пользователя:",
-        reply_markup=status_choice_kb(f"report_status:{report_id}")
+        reply_markup=report_status_kb(report_id)
     )
-    await cb.answer("Принято")
 
 
-@router_staff.callback_query(F.data.startswith("report_status:"))
-async def report_set_status(cb: CallbackQuery, bot: Bot):
-    # callback_data: report_status:<report_id>:<status> — но у нас двухэтапный
-    # Первый раз приходит report_status:<report_id>, потом set:
-    parts = cb.data.split(":")
-    if len(parts) == 2:
-        # выбрали статус через status_choice_kb
-        report_id = int(parts[1])
-        await cb.message.answer(
-            "Выбери статус:",
-            reply_markup=status_choice_kb(f"report_apply:{report_id}")
-        )
-        await cb.answer()
-        return
-    await cb.answer()
-
-
+# ---- Жалобы: применить статус ----
 @router_staff.callback_query(F.data.startswith("report_apply:"))
 async def report_apply_status(cb: CallbackQuery, bot: Bot):
-    # report_apply:<report_id>  ← выбрано через status_choice_kb → второй шаг:
-    # но у нас callback_data статуса имеет вид report_apply:<report_id>:<status>
     parts = cb.data.split(":")
-    if len(parts) == 3:
-        _, report_id_str, status = parts
-        report_id = int(report_id_str)
-    else:
-        await cb.answer()
+    if len(parts) != 3:
+        await safe_answer(cb)
         return
+    _, report_id_str, status = parts
+    report_id = int(report_id_str)
 
     role = await get_user_role(cb.from_user.id)
     if not await role_can_set_status(role):
-        await cb.answer("Нет доступа", show_alert=True)
+        await safe_answer(cb, "Нет доступа", alert=True)
         return
 
     rep = await get_report(report_id)
     if not rep:
-        await cb.answer("Жалоба не найдена", show_alert=True)
+        await safe_answer(cb, "Жалоба не найдена", alert=True)
         return
+
+    await safe_answer(cb, "Статус: " + STATUS_LABELS[status])
 
     target_id = rep["target_id"]
     await set_status(target_id, status, "По жалобе", None)
 
-    # Ссылку на доказательства — в канал доказательств
     target_user = await get_user(target_id) or {}
     await send_evidence(bot, rep, target_user, status)
 
     await set_report_status(report_id, "resolved", cb.from_user.id)
-    await log_action(cb.from_user.id, f"report_status:{status}", target_id,
-                     f"report={report_id}")
+    await log_action(cb.from_user.id, "report_status:" + status, target_id,
+                     "report=" + str(report_id))
+    actor_mention = user_mention(cb.from_user)
     await send_log(bot,
-        f"✅ Жалоба #{report_id} решена: <b>{STATUS_LABELS[status]}</b> "
-        f"для <code>{target_id}</code> модератором "
-        f"{user_mention(cb.from_user)}")
+        "✅ Жалоба #" + str(report_id) + " решена: <b>" + STATUS_LABELS[status] +
+        "</b> для <code>" + str(target_id) + "</code> модератором " + actor_mention)
 
-    # Уведомляем автора жалобы
     try:
         await bot.send_message(
             rep["reporter_id"],
-            f"✅ По твоей жалобе #{report_id} принято решение:\n"
-            f"Пользователь <code>{target_id}</code> → {STATUS_LABELS[status]}"
+            "✅ По твоей жалобе #" + str(report_id) + " принято решение:\n"
+            "Пользователь <code>" + str(target_id) + "</code> → " +
+            STATUS_LABELS[status]
         )
     except Exception:
         pass
 
-    # Уведомляем цель
     try:
         await bot.send_message(
             target_id,
-            f"⚖️ Твой статус изменён на: {STATUS_LABELS[status]}\n"
-            f"Если считаешь это ошибкой — обжалуй через /start."
+            "⚖️ Твой статус изменён на: " + STATUS_LABELS[status] + "\n"
+            "Если считаешь это ошибкой — обжалуй через /start."
         )
     except Exception:
         pass
 
-    await cb.message.answer(f"✅ Статус установлен: {STATUS_LABELS[status]}")
-    await cb.answer()
+    await cb.message.answer("✅ Статус установлен: " + STATUS_LABELS[status])
 
 
 @router_staff.callback_query(F.data.startswith("report_reject:"))
 async def report_reject(cb: CallbackQuery, bot: Bot):
     role = await get_user_role(cb.from_user.id)
     if not await role_can_set_status(role):
-        await cb.answer("Нет доступа", show_alert=True)
+        await safe_answer(cb, "Нет доступа", alert=True)
         return
+
     report_id = int(cb.data.split(":")[1])
     rep = await get_report(report_id)
     if not rep or rep["status"] != "pending":
-        await cb.answer("Уже обработана", show_alert=True)
+        await safe_answer(cb, "Уже обработана", alert=True)
         return
+
+    await safe_answer(cb, "Отклонено")
+
     await set_report_status(report_id, "rejected", cb.from_user.id)
     await log_action(cb.from_user.id, "report_reject", rep["target_id"],
-                     f"report={report_id}")
+                     "report=" + str(report_id))
     try:
         await bot.send_message(rep["reporter_id"],
-            f"❌ Жалоба #{report_id} отклонена модератором.")
+            "❌ Жалоба #" + str(report_id) + " отклонена модератором.")
     except Exception:
         pass
     await cb.message.answer("❌ Отклонено.")
-    await cb.answer()
 
 
 @router_staff.callback_query(F.data.startswith("report_msg:"))
 async def report_msg(cb: CallbackQuery, state: FSMContext):
     role = await get_user_role(cb.from_user.id)
     if not await role_can_set_status(role):
-        await cb.answer("Нет доступа", show_alert=True)
+        await safe_answer(cb, "Нет доступа", alert=True)
         return
+
     report_id = int(cb.data.split(":")[1])
     rep = await get_report(report_id)
     if not rep:
-        await cb.answer("Не найдено", show_alert=True)
+        await safe_answer(cb, "Не найдено", alert=True)
         return
+
     conv = await get_conversation_by_ref("report", report_id)
     if conv and not await claim_conversation(conv["id"], cb.from_user.id):
-        await cb.answer("Диалог ведёт другой модератор", show_alert=True)
+        await safe_answer(cb, "Диалог ведёт другой модератор", alert=True)
         return
+
+    await safe_answer(cb)
     await state.set_state(ConvFSM.waiting_staff_message)
     await state.update_data(kind="report", ref_id=report_id,
                             conv_id=conv["id"], target_user=rep["reporter_id"],
                             as_staff=True)
     await cb.message.answer("✍️ Напиши сообщение автору жалобы:")
-    await cb.answer()
 
 
 @router_staff.message(ConvFSM.waiting_staff_message, IsPrivateChat())
@@ -1977,13 +2094,14 @@ async def conv_staff_send(message: Message, state: FSMContext, bot: Bot):
     video_id = message.video.file_id if message.video else None
     text = message.caption or message.text or ""
 
-    await add_conv_message(conv_id, message.from_user.id,
-                            is_mod=True, text=text,
-                            photo_id=photo_id, video_id=video_id)
+    await add_conv_message(conv_id, message.from_user.id, is_mod=True,
+                            text=text, photo_id=photo_id, video_id=video_id)
 
     kb = conv_reply_kb(kind, ref_id, message.from_user.id)
-    body = (f"💬 <b>Сообщение от модератора</b>\n"
-            f"(по {kind} #{ref_id})\n\n{text or '—'}")
+    body = (
+        "💬 <b>Сообщение от модератора</b>\n"
+        "(по " + kind + " #" + str(ref_id) + ")\n\n" + (text or "—")
+    )
     try:
         if photo_id:
             await bot.send_photo(target_user, photo_id, caption=body, reply_markup=kb)
@@ -1992,7 +2110,7 @@ async def conv_staff_send(message: Message, state: FSMContext, bot: Bot):
         else:
             await bot.send_message(target_user, body, reply_markup=kb)
     except Exception as e:
-        await message.answer(f"Не смог отправить: {e}")
+        await message.answer("Не смог отправить: " + str(e))
         await state.clear()
         return
 
@@ -2005,40 +2123,41 @@ async def conv_staff_reply(cb: CallbackQuery, state: FSMContext):
     conv_id = int(cb.data.split(":")[1])
     conv = await get_conversation(conv_id)
     if not conv or conv["status"] == "closed":
-        await cb.answer("Диалог закрыт", show_alert=True)
+        await safe_answer(cb, "Диалог закрыт", alert=True)
         return
     if conv.get("moderator_id") and conv["moderator_id"] != cb.from_user.id:
-        await cb.answer("Диалог ведёт другой модератор", show_alert=True)
+        await safe_answer(cb, "Диалог ведёт другой модератор", alert=True)
         return
+    await safe_answer(cb)
     await state.set_state(ConvFSM.waiting_staff_message)
     await state.update_data(kind=conv["kind"], ref_id=conv["ref_id"],
                             conv_id=conv_id, target_user=conv["user_id"],
                             as_staff=True)
     await cb.message.answer("✍️ Напиши сообщение пользователю:")
-    await cb.answer()
 
 
 @router_staff.callback_query(F.data.startswith("conv_close:"))
 async def conv_close(cb: CallbackQuery, bot: Bot):
     role = await get_user_role(cb.from_user.id)
     if not await role_can_set_status(role):
-        await cb.answer("Нет доступа", show_alert=True)
+        await safe_answer(cb, "Нет доступа", alert=True)
         return
     conv_id = int(cb.data.split(":")[1])
     conv = await get_conversation(conv_id)
     if not conv:
-        await cb.answer("Не найдено", show_alert=True)
+        await safe_answer(cb, "Не найдено", alert=True)
         return
     if conv.get("moderator_id") and conv["moderator_id"] != cb.from_user.id:
-        await cb.answer("Диалог ведёт другой модератор", show_alert=True)
+        await safe_answer(cb, "Диалог ведёт другой модератор", alert=True)
         return
+
+    await safe_answer(cb, "Закрыто")
     await close_conversation(conv_id)
     try:
         await bot.send_message(conv["user_id"], "🔒 Диалог закрыт модератором.")
     except Exception:
         pass
     await cb.message.answer("🔒 Диалог закрыт.")
-    await cb.answer()
 
 
 # ---- Апелляции: список ----
@@ -2046,126 +2165,140 @@ async def conv_close(cb: CallbackQuery, bot: Bot):
 async def cb_staff_appeals(cb: CallbackQuery):
     role = await get_user_role(cb.from_user.id)
     if not await role_can_set_status(role):
-        await cb.answer("Нет доступа", show_alert=True)
+        await safe_answer(cb, "Нет доступа", alert=True)
         return
+
+    await safe_answer(cb)
+
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
             "SELECT * FROM appeals WHERE status='pending' ORDER BY id ASC LIMIT 10")
-        rows = await cur.fetchall()
+        rows = [dict(r) for r in await cur.fetchall()]
+
     if not rows:
         await cb.message.answer("📭 Нет новых апелляций.")
-        await cb.answer()
         return
+
     for r in rows:
-        r = dict(r)
         u = await get_user(r["user_id"]) or {}
+        from_mention = user_mention_by_id(
+            r["user_id"],
+            u.get("username"),
+            u.get("full_name"),
+        )
         body = (
-            f"⚖️ <b>Апелляция #{r['id']}</b>\n"
-            f"От: {user_mention_by_id(r['user_id'], u.get('username'), u.get('full_name'))}\n"
-            f"Текст: {r.get('text') or '—'}"
+            "⚖️ <b>Апелляция #" + str(r["id"]) + "</b>\n"
+            "От: " + from_mention + "\n"
+            "Текст: " + (r.get("text") or "—")
         )
         kb = appeal_review_kb(r["id"])
-        if r.get("photo_id"):
-            await cb.message.answer_photo(r["photo_id"], caption=body, reply_markup=kb)
-        elif r.get("video_id"):
-            await cb.message.answer_video(r["video_id"], caption=body, reply_markup=kb)
-        else:
-            await cb.message.answer(body, reply_markup=kb)
-    await cb.answer()
+        try:
+            if r.get("photo_id"):
+                await cb.message.answer_photo(r["photo_id"], caption=body,
+                                               reply_markup=kb)
+            elif r.get("video_id"):
+                await cb.message.answer_video(r["video_id"], caption=body,
+                                               reply_markup=kb)
+            else:
+                await cb.message.answer(body, reply_markup=kb)
+        except TelegramBadRequest as e:
+            log.warning("appeals item: %s", e)
 
 
 @router_staff.callback_query(F.data.startswith("appeal_change:"))
 async def appeal_change(cb: CallbackQuery, state: FSMContext):
     role = await get_user_role(cb.from_user.id)
     if not await role_can_set_status(role):
-        await cb.answer("Нет доступа", show_alert=True)
+        await safe_answer(cb, "Нет доступа", alert=True)
         return
     appeal_id = int(cb.data.split(":")[1])
     appeal = await get_appeal(appeal_id)
     if not appeal:
-        await cb.answer("Не найдено", show_alert=True)
+        await safe_answer(cb, "Не найдено", alert=True)
         return
     conv = await get_conversation_by_ref("appeal", appeal_id)
     if conv and not await claim_conversation(conv["id"], cb.from_user.id):
-        await cb.answer("Ведёт другой модератор", show_alert=True)
+        await safe_answer(cb, "Ведёт другой модератор", alert=True)
         return
+    await safe_answer(cb)
     await state.update_data(appeal_id=appeal_id, appeal_user=appeal["user_id"])
     await cb.message.answer("Выбери новый статус:",
                              reply_markup=status_choice_kb("appeal"))
-    await cb.answer()
 
 
 @router_staff.callback_query(F.data.startswith("appeal:"))
 async def appeal_apply(cb: CallbackQuery, state: FSMContext, bot: Bot):
     role = await get_user_role(cb.from_user.id)
     if not await role_can_set_status(role):
-        await cb.answer("Нет доступа", show_alert=True)
+        await safe_answer(cb, "Нет доступа", alert=True)
         return
     new_status = cb.data.split(":", 1)[1]
     data = await state.get_data()
     appeal_id = data.get("appeal_id")
     user_id = data.get("appeal_user")
     if not user_id:
-        await cb.answer("Данные потеряны", show_alert=True)
+        await safe_answer(cb, "Данные потеряны", alert=True)
         return
+
+    await safe_answer(cb, "Изменено")
+
     await set_status(user_id, new_status, "Решение по апелляции")
     await set_appeal_status(appeal_id, "changed", cb.from_user.id)
-    await log_action(cb.from_user.id, f"appeal_change:{new_status}",
-                     user_id, f"appeal={appeal_id}")
+    await log_action(cb.from_user.id, "appeal_change:" + new_status,
+                     user_id, "appeal=" + str(appeal_id))
     try:
         await bot.send_message(user_id,
-            f"⚖️ Апелляция рассмотрена. Новый статус: {STATUS_LABELS[new_status]}")
+            "⚖️ Апелляция рассмотрена. Новый статус: " + STATUS_LABELS[new_status])
     except Exception:
         pass
-    await send_log(bot,
-        f"⚖️ Апелляция #{appeal_id} → {STATUS_LABELS[new_status]}")
+    await send_log(bot, "⚖️ Апелляция #" + str(appeal_id) + " → " +
+                        STATUS_LABELS[new_status])
     await cb.message.answer("✅ Изменено.")
     await state.clear()
-    await cb.answer()
 
 
 @router_staff.callback_query(F.data.startswith("appeal_reject:"))
 async def appeal_reject(cb: CallbackQuery, state: FSMContext, bot: Bot):
     role = await get_user_role(cb.from_user.id)
     if not await role_can_set_status(role):
-        await cb.answer("Нет доступа", show_alert=True)
+        await safe_answer(cb, "Нет доступа", alert=True)
         return
     appeal_id = int(cb.data.split(":")[1])
     appeal = await get_appeal(appeal_id)
     if not appeal:
-        await cb.answer("Не найдено", show_alert=True)
+        await safe_answer(cb, "Не найдено", alert=True)
         return
+    await safe_answer(cb, "Отклонено")
     await set_appeal_status(appeal_id, "rejected", cb.from_user.id)
     try:
         await bot.send_message(appeal["user_id"], "❌ Апелляция отклонена.")
     except Exception:
         pass
     await cb.message.answer("Отклонено.")
-    await cb.answer()
 
 
 @router_staff.callback_query(F.data.startswith("appeal_msg:"))
 async def appeal_msg(cb: CallbackQuery, state: FSMContext):
     role = await get_user_role(cb.from_user.id)
     if not await role_can_set_status(role):
-        await cb.answer("Нет доступа", show_alert=True)
+        await safe_answer(cb, "Нет доступа", alert=True)
         return
     appeal_id = int(cb.data.split(":")[1])
     appeal = await get_appeal(appeal_id)
     if not appeal:
-        await cb.answer("Не найдено", show_alert=True)
+        await safe_answer(cb, "Не найдено", alert=True)
         return
     conv = await get_conversation_by_ref("appeal", appeal_id)
     if conv and not await claim_conversation(conv["id"], cb.from_user.id):
-        await cb.answer("Ведёт другой модератор", show_alert=True)
+        await safe_answer(cb, "Ведёт другой модератор", alert=True)
         return
+    await safe_answer(cb)
     await state.set_state(ConvFSM.waiting_staff_message)
     await state.update_data(kind="appeal", ref_id=appeal_id,
                             conv_id=conv["id"], target_user=appeal["user_id"],
                             as_staff=True)
     await cb.message.answer("✍️ Напиши сообщение автору апелляции:")
-    await cb.answer()
 
 
 # ---- Статусы (модераторы) ----
@@ -2173,15 +2306,15 @@ async def appeal_msg(cb: CallbackQuery, state: FSMContext):
 async def admin_set_status(cb: CallbackQuery, state: FSMContext):
     role = await get_user_role(cb.from_user.id)
     if not await role_can_set_status(role):
-        await cb.answer("Нет доступа", show_alert=True)
+        await safe_answer(cb, "Нет доступа", alert=True)
         return
+    await safe_answer(cb)
     await state.update_data(action="set")
     await state.set_state(StaffFSM.waiting_target)
     await cb.message.answer(
         "Отправь <code>@username</code>, <code>ID</code> или "
         "<code>@username ID</code>."
     )
-    await cb.answer()
 
 
 @router_staff.message(StaffFSM.waiting_target, F.text, IsPrivateChat())
@@ -2224,7 +2357,7 @@ async def staff_target(message: Message, state: FSMContext):
     if action == "ban":
         await set_status(target_id, STATUS_BANNED, "Глобальный бан", None)
         await log_action(message.from_user.id, "ban_anywhere", target_id)
-        await message.answer(f"⛔ <code>{target_id}</code> забанен везде.")
+        await message.answer("⛔ <code>" + str(target_id) + "</code> забанен везде.")
         await state.clear()
         return
 
@@ -2236,8 +2369,8 @@ async def staff_target(message: Message, state: FSMContext):
         return
 
     await state.set_state(None)
-    label = f"@{target_username}" if target_username else str(target_id)
-    await message.answer(f"Выбери статус для <code>{label}</code>:",
+    label = ("@" + target_username) if target_username else str(target_id)
+    await message.answer("Выбери статус для <code>" + label + "</code>:",
                          reply_markup=status_choice_kb("set"))
 
 
@@ -2245,29 +2378,28 @@ async def staff_target(message: Message, state: FSMContext):
 async def staff_pick_status(cb: CallbackQuery, state: FSMContext, bot: Bot):
     role = await get_user_role(cb.from_user.id)
     if not await role_can_set_status(role):
-        await cb.answer("Нет доступа", show_alert=True)
+        await safe_answer(cb, "Нет доступа", alert=True)
         return
     status = cb.data.split(":", 1)[1]
     data = await state.get_data()
     if status in (STATUS_SCAM, STATUS_SUSPICIOUS):
+        await safe_answer(cb)
         await state.update_data(pending_status=status)
         await state.set_state(StaffFSM.waiting_reason)
         await cb.message.answer("Введи причину:")
     else:
+        await safe_answer(cb, "Статус: " + STATUS_LABELS[status])
         await _apply_status(data.get("target_id"), data.get("target_username"),
                             status, None, None, cb.from_user.id, bot)
         await state.clear()
-        await cb.message.answer(f"✅ Статус: {STATUS_LABELS[status]}")
-    await cb.answer()
+        await cb.message.answer("✅ Статус: " + STATUS_LABELS[status])
 
 
 @router_staff.message(StaffFSM.waiting_reason, IsPrivateChat())
 async def staff_reason(message: Message, state: FSMContext):
     await state.update_data(pending_reason=message.text)
     await state.set_state(StaffFSM.waiting_evidence)
-    await message.answer(
-        "Пришли ссылку на сообщение с доказательствами или <code>-</code>."
-    )
+    await message.answer("Пришли ссылку на доказательства или <code>-</code>.")
 
 
 @router_staff.message(StaffFSM.waiting_evidence, IsPrivateChat())
@@ -2294,45 +2426,53 @@ async def _apply_status(target_id, target_username, status,
         return
     await set_status(target_id, status, reason, evidence_url,
                      username=target_username)
-    await log_action(actor_id, f"set_status:{status}", target_id,
-                     f"reason={reason}; evidence={evidence_url}")
+    await log_action(actor_id, "set_status:" + status, target_id,
+                     "reason=" + str(reason) + "; evidence=" + str(evidence_url))
     actor = await get_user(actor_id) or {}
+    actor_mention = user_mention_by_id(
+        actor_id,
+        actor.get("username"),
+        actor.get("full_name"),
+    )
     await send_log(bot,
-        f"📌 {user_mention_by_id(actor_id, actor.get('username'), actor.get('full_name'))} "
-        f"установил <b>{STATUS_LABELS[status]}</b> → <code>{target_id}</code>\n"
-        f"Причина: {reason or '—'}")
+        "📌 " + actor_mention + " установил <b>" + STATUS_LABELS[status] +
+        "</b> → <code>" + str(target_id) + "</code>\n"
+        "Причина: " + (reason or "—"))
 
 
 @router_staff.callback_query(F.data == "admin_ban_anywhere")
 async def admin_ban_start(cb: CallbackQuery, state: FSMContext):
     role = await get_user_role(cb.from_user.id)
     if not await role_can_set_status(role):
-        await cb.answer("Нет доступа", show_alert=True)
+        await safe_answer(cb, "Нет доступа", alert=True)
         return
+    await safe_answer(cb)
     await state.update_data(action="ban")
     await state.set_state(StaffFSM.waiting_target)
     await cb.message.answer("Отправь @username или ID.")
-    await cb.answer()
 
 
 @router_staff.callback_query(F.data == "admin_reset_status")
 async def admin_reset_start(cb: CallbackQuery, state: FSMContext):
     role = await get_user_role(cb.from_user.id)
     if not await role_can_set_status(role):
-        await cb.answer("Нет доступа", show_alert=True)
+        await safe_answer(cb, "Нет доступа", alert=True)
         return
+    await safe_answer(cb)
     await state.update_data(action="reset")
     await state.set_state(StaffFSM.waiting_target)
     await cb.message.answer("Кому сбросить? Отправь @username или ID.")
-    await cb.answer()
 
 
 @router_staff.callback_query(F.data == "admin_stats")
 async def admin_stats(cb: CallbackQuery):
     role = await get_user_role(cb.from_user.id)
     if not await role_can_set_status(role):
-        await cb.answer("Нет доступа", show_alert=True)
+        await safe_answer(cb, "Нет доступа", alert=True)
         return
+
+    await safe_answer(cb)
+
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT COUNT(*) FROM users")
         total = (await cur.fetchone())[0]
@@ -2350,17 +2490,17 @@ async def admin_stats(cb: CallbackQuery):
         rp_pending = (await cur.fetchone())[0]
         cur = await db.execute("SELECT COUNT(*) FROM reports")
         rp_total = (await cur.fetchone())[0]
+
     await cb.message.answer(
-        f"📊 <b>Статистика</b>\n"
-        f"Всего юзеров: {total}\n"
-        f"🚨 Скамеров: {scams}\n"
-        f"⛔ Забанено: {banned}\n"
-        f"🛡 Модераторов: {mods}\n"
-        f"🛠 Админов: {admins}\n"
-        f"🚨 Жалоб новых: {rp_pending} (всего {rp_total})\n"
-        f"⚖️ Апелляций новых: {ap_pending}"
+        "📊 <b>Статистика</b>\n"
+        "Всего юзеров: " + str(total) + "\n"
+        "🚨 Скамеров: " + str(scams) + "\n"
+        "⛔ Забанено: " + str(banned) + "\n"
+        "🛡 Модераторов: " + str(mods) + "\n"
+        "🛠 Админов: " + str(admins) + "\n"
+        "🚨 Жалоб новых: " + str(rp_pending) + " (всего " + str(rp_total) + ")\n"
+        "⚖️ Апелляций новых: " + str(ap_pending)
     )
-    await cb.answer()
 
 
 # ==========================================================
@@ -2377,10 +2517,10 @@ async def cmd_settings(message: Message, bot: Bot):
     reqs = await list_required_chats(chat_id)
 
     text = (
-        f"⚙️ <b>Настройки группы</b>\n\n"
-        f"<b>Приветствие:</b>\n{welcome}\n\n"
-        f"<b>Обязательных подписок:</b> {len(reqs)}\n\n"
-        f"💡 Переменные: <code>{{group_name}}</code>, <code>{{username}}</code>"
+        "⚙️ <b>Настройки группы</b>\n\n"
+        "<b>Приветствие:</b>\n" + welcome + "\n\n"
+        "<b>Обязательных подписок:</b> " + str(len(reqs)) + "\n\n"
+        "💡 Переменные: <code>{group_name}</code>, <code>{username}</code>"
     )
     await message.reply(text, reply_markup=settings_menu(chat_id))
 
@@ -2388,11 +2528,11 @@ async def cmd_settings(message: Message, bot: Bot):
 def settings_menu(chat_id):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Приветствие",
-                              callback_data=f"settings:welcome:{chat_id}")],
+                              callback_data="settings:welcome:" + str(chat_id))],
         [InlineKeyboardButton(text="🔒 Добавить подписку",
-                              callback_data=f"settings:required:{chat_id}")],
+                              callback_data="settings:required:" + str(chat_id))],
         [InlineKeyboardButton(text="📋 Список подписок",
-                              callback_data=f"settings:list:{chat_id}")],
+                              callback_data="settings:list:" + str(chat_id))],
     ])
 
 
@@ -2400,8 +2540,9 @@ def settings_menu(chat_id):
 async def cb_settings_welcome(cb: CallbackQuery, state: FSMContext, bot: Bot):
     chat_id = int(cb.data.split(":")[2])
     if not await is_chat_admin(bot, chat_id, cb.from_user.id):
-        await cb.answer("Нет доступа", show_alert=True)
+        await safe_answer(cb, "Нет доступа", alert=True)
         return
+    await safe_answer(cb)
     await state.set_state(SettingsFSM.waiting_welcome)
     await state.update_data(chat_id=chat_id)
     await cb.message.answer(
@@ -2409,7 +2550,6 @@ async def cb_settings_welcome(cb: CallbackQuery, state: FSMContext, bot: Bot):
         "Переменные: <code>{group_name}</code>, <code>{username}</code>\n"
         "Отправь <code>-</code>, чтобы сбросить."
     )
-    await cb.answer()
 
 
 @router_group.message(SettingsFSM.waiting_welcome, IsGroupChat())
@@ -2434,12 +2574,12 @@ async def settings_set_welcome(message: Message, state: FSMContext, bot: Bot):
 async def cb_settings_required(cb: CallbackQuery, state: FSMContext, bot: Bot):
     chat_id = int(cb.data.split(":")[2])
     if not await is_chat_admin(bot, chat_id, cb.from_user.id):
-        await cb.answer("Нет доступа", show_alert=True)
+        await safe_answer(cb, "Нет доступа", alert=True)
         return
+    await safe_answer(cb)
     await state.set_state(SettingsFSM.waiting_req_chat)
     await state.update_data(chat_id=chat_id)
     await cb.message.answer("🔒 Отправь ссылку на канал/группу (@name или https://t.me/name).")
-    await cb.answer()
 
 
 @router_group.message(SettingsFSM.waiting_req_chat, IsGroupChat())
@@ -2459,10 +2599,10 @@ async def settings_set_req_chat(message: Message, state: FSMContext, bot: Bot):
     title = await get_chat_title(bot, username)
     req_chat_id = None
     try:
-        chat = await bot.get_chat(f"@{username}")
+        chat = await bot.get_chat("@" + username)
         req_chat_id = chat.id
     except Exception as e:
-        await message.reply(f"❌ Не могу получить чат. {e}")
+        await message.reply("❌ Не могу получить чат. " + str(e))
         return
     await state.update_data(req_chat_id=req_chat_id,
                             req_username=username, title=title, link=link)
@@ -2496,7 +2636,7 @@ async def settings_set_req_time(message: Message, state: FSMContext, bot: Bot):
         added_by=message.from_user.id,
     )
     await log_action(message.from_user.id, "add_required_chat", chat_id,
-                     f"req={data.get('req_username')}")
+                     "req=" + str(data.get("req_username")))
     await message.reply("✅ Добавлено.")
     await state.clear()
 
@@ -2505,32 +2645,21 @@ async def settings_set_req_time(message: Message, state: FSMContext, bot: Bot):
 async def cb_settings_list(cb: CallbackQuery, bot: Bot):
     chat_id = int(cb.data.split(":")[2])
     if not await is_chat_admin(bot, chat_id, cb.from_user.id):
-        await cb.answer("Нет доступа", show_alert=True)
+        await safe_answer(cb, "Нет доступа", alert=True)
         return
     reqs = await list_required_chats(chat_id)
+    await safe_answer(cb)
     if not reqs:
         await cb.message.answer("ℹ️ Список пуст.")
-        await cb.answer()
         return
     text = "📋 <b>Обязательные подписки:</b>\n\n"
     for r in reqs:
-        title = r["title"] or f"@{r['req_username']}"
+        title = r["title"] or ("@" + r["req_username"])
         exp = r["expire_at"]
-        text += f"• <a href=\"{r['link']}\">{title}</a> — "
-        text += "бессрочно\n" if not exp else f"до {exp[:16]}\n"
+        text += "• <a href=\"" + r["link"] + "\">" + title + "</a> — "
+        text += "бессрочно\n" if not exp else "до " + exp[:16] + "\n"
     await cb.message.answer(text, reply_markup=remgroup_kb(chat_id, reqs),
                              disable_web_page_preview=True)
-    await cb.answer()
-
-
-def remgroup_kb(chat_id, reqs):
-    rows = []
-    for r in reqs:
-        title = r["title"] or f"@{r['req_username']}"
-        rows.append([InlineKeyboardButton(
-            text=f"🗑 {title}"[:60],
-            callback_data=f"remgroup:{chat_id}:{r['id']}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
 
 @router_group.callback_query(F.data.startswith("remgroup:"))
@@ -2539,15 +2668,16 @@ async def cb_remgroup(cb: CallbackQuery, bot: Bot):
     chat_id = int(chat_id_str)
     req_id = int(req_id_str)
     if not await is_chat_admin(bot, chat_id, cb.from_user.id):
-        await cb.answer("Нет доступа", show_alert=True)
+        await safe_answer(cb, "Нет доступа", alert=True)
         return
+    await safe_answer(cb, "Удалено")
     await delete_required_chat(req_id)
-    await log_action(cb.from_user.id, "delete_required_chat", chat_id, f"req_id={req_id}")
+    await log_action(cb.from_user.id, "delete_required_chat", chat_id,
+                     "req_id=" + str(req_id))
     try:
         await cb.message.delete()
     except Exception:
         pass
-    await cb.answer("🗑 Удалено")
 
 
 @router_group.message(Command("check"), IsGroupChat())
@@ -2583,18 +2713,17 @@ async def cmd_check(message: Message):
         await send_status_card(message, user, reply_to=message)
     else:
         await message.reply(
-            f"📇 <b>Проверка</b>\n"
-            f"ID: <code>{target_id or '—'}</code>\n"
-            f"Имя: {target_name or '—'}\n"
-            f"Юзернейм: @{target_username or '—'}\n"
-            f"Статус: {STATUS_LABELS[STATUS_NORMAL]}\n\n"
-            f"<i>Пользователя нет в базе.</i>"
+            "📇 <b>Проверка</b>\n"
+            "ID: <code>" + str(target_id or "—") + "</code>\n"
+            "Имя: " + (target_name or "—") + "\n"
+            "Юзернейм: @" + (target_username or "—") + "\n"
+            "Статус: " + STATUS_LABELS[STATUS_NORMAL] + "\n\n"
+            "<i>Пользователя нет в базе.</i>"
         )
 
 
 @router_group.message(Command("report"), IsGroupChat())
 async def cmd_report(message: Message, bot: Bot):
-    # реплай на сообщение → ведём в бота
     target = None
     if message.reply_to_message and message.reply_to_message.from_user:
         target = message.reply_to_message.from_user
@@ -2612,11 +2741,12 @@ async def cmd_report(message: Message, bot: Bot):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
             text="📨 Открыть бота и пожаловаться",
-            url=f"https://t.me/{me.username}?start=report_{target.id}")],
+            url="https://t.me/" + me.username + "?start=report_" + str(target.id))],
     ])
+    target_mention = user_mention(target)
     await message.reply(
-        f"🚨 Жалоба на {user_mention(target)}\n\n"
-        f"Перейди в бота — там отправь доказательства одним сообщением.",
+        "🚨 Жалоба на " + target_mention + "\n\n"
+        "Перейди в бота — там отправь доказательства одним сообщением.",
         reply_markup=kb,
     )
 
@@ -2632,16 +2762,16 @@ async def on_chat_member(event: ChatMemberUpdated, bot: Bot):
         s = await get_chat_settings(event.chat.id)
         if s.get("welcome_enabled"):
             if u.username:
-                mention = f"@{u.username}"
+                mention = "@" + u.username
             else:
-                mention = f'<a href="tg://user?id={u.id}">{u.full_name}</a>'
+                mention = "<a href=\"tg://user?id=" + str(u.id) + "\">" + str(u.full_name) + "</a>"
             template = s.get("welcome_text")
             if template:
                 text = template.replace("{group_name}", event.chat.title or "группа")
                 text = text.replace("{username}", mention)
             else:
-                text = (f"👋 Добро пожаловать в <b>{event.chat.title or 'этот чат'}</b>, "
-                        f"{mention}!\n\nПриятного общения! 🎉")
+                text = ("👋 Добро пожаловать в <b>" + (event.chat.title or "этот чат") +
+                        "</b>, " + mention + "!\n\nПриятного общения! 🎉")
             try:
                 await send_photo_cached(bot, event.chat.id, IMAGE_HELLO, text,
                                         cache_prefix="banner")
@@ -2665,10 +2795,10 @@ async def bot_added(event: ChatMemberUpdated, bot: Bot):
         invalidate_admin_cache(event.chat.id)
         try:
             text = (
-                f"👋 Привет! Я бот-помощник.\n\n"
-                f"<code>/check @username</code> — проверить\n"
-                f"<code>/report</code> реплаем — пожаловаться\n"
-                f"<code>/settings</code> — настройки (админ группы)"
+                "👋 Привет! Я бот-помощник.\n\n"
+                "<code>/check @username</code> — проверить\n"
+                "<code>/report</code> реплаем — пожаловаться\n"
+                "<code>/settings</code> — настройки (админ группы)"
             )
             await send_photo_cached(bot, event.chat.id, IMAGE_HELLO, text,
                                     cache_prefix="banner")
@@ -2701,10 +2831,15 @@ async def user_start_deeplink(message: Message, state: FSMContext, bot: Bot):
         return await user_start(message, state, bot)
     await state.set_state(ReportFSM.waiting_evidence)
     target_user = await get_user(target_id) or {}
+    target_mention = user_mention_by_id(
+        target_id,
+        target_user.get("username"),
+        target_user.get("full_name"),
+    )
     await message.answer(
-        f"📨 Жалоба на {user_mention_by_id(target_id, target_user.get('username'), target_user.get('full_name'))}\n\n"
-        f"Отправь доказательства одним сообщением (текст, фото или видео).\n"
-        f"Можно начать с описания: <code>{target_id} описание</code>"
+        "📨 Жалоба на " + target_mention + "\n\n"
+        "Отправь доказательства одним сообщением (текст, фото или видео).\n"
+        "Можно начать с описания: <code>" + str(target_id) + " описание</code>"
     )
 
 
@@ -2732,7 +2867,6 @@ async def main():
     await upsert_user(SUPER_ADMIN_ID)
     await set_user_role(SUPER_ADMIN_ID, ROLE_SUPER)
 
-    # Попробуем резолвнуть ID для лог-группы
     global RESOLVED_LOG_ID
     if not RESOLVED_LOG_ID and LOG_GROUP_URL:
         RESOLVED_LOG_ID = await _resolve_group_id(bot, LOG_GROUP_URL, None)
