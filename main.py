@@ -62,7 +62,7 @@ RESOLVED_LOG_ID = LOG_GROUP_ID
 RESOLVED_EVIDENCE_ID = EVIDENCE_GROUP_ID
 
 # ==========================================================
-# СТАТУСЫ ПОЛЬЗОВАТЕЛЯ
+# СТАТУСЫ
 # ==========================================================
 STATUS_SCAM = "scam"
 STATUS_SUSPICIOUS = "suspicious"
@@ -257,10 +257,9 @@ def is_command(message):
 
 
 # ==========================================================
-# БЕЗОПАСНЫЙ ОТВЕТ НА CALLBACK
+# БЕЗОПАСНЫЙ ANSWER
 # ==========================================================
 async def safe_answer(cb: CallbackQuery, text: str = None, alert: bool = False):
-    """Никогда не падает, даже если колбэк протух."""
     try:
         if text:
             await cb.answer(text, show_alert=alert)
@@ -359,6 +358,14 @@ async def init_db():
         )
         """)
         await db.execute("""
+        CREATE TABLE IF NOT EXISTS username_history (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id    INTEGER NOT NULL,
+            username   TEXT NOT NULL,
+            seen_at    TEXT
+        )
+        """)
+        await db.execute("""
         CREATE TABLE IF NOT EXISTS appeals (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id    INTEGER,
@@ -399,6 +406,10 @@ async def init_db():
             chat_id          INTEGER PRIMARY KEY,
             welcome_text     TEXT,
             welcome_enabled  INTEGER DEFAULT 1,
+            welcome_image    TEXT,
+            antispam_links   INTEGER DEFAULT 1,
+            antispam_caps    INTEGER DEFAULT 1,
+            antispam_flood   INTEGER DEFAULT 1,
             updated_at       TEXT
         )
         """)
@@ -452,37 +463,27 @@ async def init_db():
         )
         """)
         await db.commit()
-
-        # Применяем миграции для существующих баз
         await _migrate_db(db)
-
     log.info("База данных готова: %s", DB_PATH)
 
 
 async def _table_columns(db, table_name):
-    """Возвращает множество имён колонок таблицы."""
     cur = await db.execute("PRAGMA table_info({})".format(table_name))
     rows = await cur.fetchall()
-    # row[1] — имя колонки
     return {row[1] for row in rows}
 
 
 async def _add_column_if_missing(db, table, column, definition):
     cols = await _table_columns(db, table)
     if column not in cols:
-        log.info("Миграция: добавляю %s.%s (%s)", table, column, definition)
+        log.info("Миграция: %s.%s", table, column)
         await db.execute(
             "ALTER TABLE {} ADD COLUMN {} {}".format(table, column, definition)
         )
 
 
 async def _migrate_db(db):
-    """
-    Добавляет отсутствующие колонки в существующие таблицы.
-    Безопасно: если колонка есть — просто пропускает.
-    Данные не теряются.
-    """
-    # === users ===
+    # users
     await _add_column_if_missing(db, "users", "username", "TEXT")
     await _add_column_if_missing(db, "users", "full_name", "TEXT")
     await _add_column_if_missing(db, "users", "status", "TEXT DEFAULT 'normal'")
@@ -491,7 +492,7 @@ async def _migrate_db(db):
     await _add_column_if_missing(db, "users", "evidence_url", "TEXT")
     await _add_column_if_missing(db, "users", "updated_at", "TEXT")
 
-    # === appeals ===
+    # appeals
     await _add_column_if_missing(db, "appeals", "user_id", "INTEGER")
     await _add_column_if_missing(db, "appeals", "text", "TEXT")
     await _add_column_if_missing(db, "appeals", "photo_id", "TEXT")
@@ -500,7 +501,7 @@ async def _migrate_db(db):
     await _add_column_if_missing(db, "appeals", "handled_by", "INTEGER")
     await _add_column_if_missing(db, "appeals", "created_at", "TEXT")
 
-    # === reports ===
+    # reports
     await _add_column_if_missing(db, "reports", "reporter_id", "INTEGER")
     await _add_column_if_missing(db, "reports", "target_id", "INTEGER")
     await _add_column_if_missing(db, "reports", "text", "TEXT")
@@ -510,12 +511,16 @@ async def _migrate_db(db):
     await _add_column_if_missing(db, "reports", "handled_by", "INTEGER")
     await _add_column_if_missing(db, "reports", "created_at", "TEXT")
 
-    # === chat_settings ===
+    # chat_settings — расширение
     await _add_column_if_missing(db, "chat_settings", "welcome_text", "TEXT")
     await _add_column_if_missing(db, "chat_settings", "welcome_enabled", "INTEGER DEFAULT 1")
+    await _add_column_if_missing(db, "chat_settings", "welcome_image", "TEXT")
+    await _add_column_if_missing(db, "chat_settings", "antispam_links", "INTEGER DEFAULT 1")
+    await _add_column_if_missing(db, "chat_settings", "antispam_caps", "INTEGER DEFAULT 1")
+    await _add_column_if_missing(db, "chat_settings", "antispam_flood", "INTEGER DEFAULT 1")
     await _add_column_if_missing(db, "chat_settings", "updated_at", "TEXT")
 
-    # === required_chats ===
+    # required_chats
     await _add_column_if_missing(db, "required_chats", "chat_id", "INTEGER")
     await _add_column_if_missing(db, "required_chats", "req_chat_id", "INTEGER")
     await _add_column_if_missing(db, "required_chats", "req_username", "TEXT")
@@ -525,7 +530,7 @@ async def _migrate_db(db):
     await _add_column_if_missing(db, "required_chats", "added_at", "TEXT")
     await _add_column_if_missing(db, "required_chats", "added_by", "INTEGER")
 
-    # === conversations ===
+    # conversations
     await _add_column_if_missing(db, "conversations", "kind", "TEXT")
     await _add_column_if_missing(db, "conversations", "ref_id", "INTEGER")
     await _add_column_if_missing(db, "conversations", "user_id", "INTEGER")
@@ -533,7 +538,7 @@ async def _migrate_db(db):
     await _add_column_if_missing(db, "conversations", "status", "TEXT DEFAULT 'open'")
     await _add_column_if_missing(db, "conversations", "created_at", "TEXT")
 
-    # === conv_messages ===
+    # conv_messages
     await _add_column_if_missing(db, "conv_messages", "conv_id", "INTEGER")
     await _add_column_if_missing(db, "conv_messages", "from_id", "INTEGER")
     await _add_column_if_missing(db, "conv_messages", "is_mod", "INTEGER DEFAULT 0")
@@ -542,9 +547,7 @@ async def _migrate_db(db):
     await _add_column_if_missing(db, "conv_messages", "video_id", "TEXT")
     await _add_column_if_missing(db, "conv_messages", "created_at", "TEXT")
 
-    # Обновим существующих юзеров: если role NULL — поставим 'user'
     await db.execute("UPDATE users SET role='user' WHERE role IS NULL")
-    # Главному админу — super
     await db.execute("UPDATE users SET role='super' WHERE user_id=?",
                      (SUPER_ADMIN_ID,))
     await db.commit()
@@ -554,7 +557,7 @@ async def _migrate_db(db):
 async def upsert_user(user_id, username=None, full_name=None):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT role FROM users WHERE user_id=?", (user_id,))
+        cur = await db.execute("SELECT role, username FROM users WHERE user_id=?", (user_id,))
         existing = await cur.fetchone()
         if existing and existing["role"]:
             role = existing["role"]
@@ -562,6 +565,8 @@ async def upsert_user(user_id, username=None, full_name=None):
                 role = ROLE_SUPER
         else:
             role = ROLE_SUPER if user_id == SUPER_ADMIN_ID else ROLE_USER
+
+        old_username = existing["username"] if existing else None
 
         await db.execute("""
             INSERT INTO users (user_id, username, full_name, status, role, updated_at)
@@ -572,6 +577,14 @@ async def upsert_user(user_id, username=None, full_name=None):
                 role=excluded.role,
                 updated_at=excluded.updated_at
         """, (user_id, username, full_name, role, datetime.utcnow().isoformat()))
+
+        # Запоминаем историю username
+        if username and username != old_username:
+            await db.execute("""
+                INSERT INTO username_history (user_id, username, seen_at)
+                VALUES (?, ?, ?)
+            """, (user_id, username, datetime.utcnow().isoformat()))
+
         await db.commit()
 
 
@@ -584,10 +597,25 @@ async def get_user(user_id):
 
 
 async def get_user_by_username(username):
+    if not username:
+        return None
+    username = username.lstrip("@")
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
+        # сначала ищем в текущих
         cur = await db.execute(
             "SELECT * FROM users WHERE LOWER(username)=LOWER(?)", (username,))
+        row = await cur.fetchone()
+        if row:
+            return dict(row)
+        # потом в истории — это позволяет находить юзера после смены @username
+        cur = await db.execute("""
+            SELECT u.* FROM users u
+            JOIN username_history h ON h.user_id = u.user_id
+            WHERE LOWER(h.username)=LOWER(?)
+            ORDER BY h.seen_at DESC
+            LIMIT 1
+        """, (username,))
         row = await cur.fetchone()
         return dict(row) if row else None
 
@@ -618,6 +646,13 @@ async def list_staff():
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
             "SELECT user_id, role FROM users WHERE role IN ('super','admin','moderator')")
+        return [dict(r) for r in await cur.fetchall()]
+
+
+async def list_all_chats():
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT chat_id, title FROM chats")
         return [dict(r) for r in await cur.fetchall()]
 
 
@@ -853,14 +888,26 @@ async def get_chat_settings(chat_id):
                                 (chat_id,))
         row = await cur.fetchone()
         if row:
-            return dict(row)
+            d = dict(row)
+            # Значения по умолчанию для старых записей
+            for k, v in (("antispam_links", 1), ("antispam_caps", 1),
+                          ("antispam_flood", 1), ("welcome_enabled", 1)):
+                if d.get(k) is None:
+                    d[k] = v
+            return d
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
-            INSERT INTO chat_settings (chat_id, welcome_text, welcome_enabled, updated_at)
-            VALUES (?, NULL, 1, ?)
+            INSERT INTO chat_settings
+                (chat_id, welcome_text, welcome_enabled,
+                 antispam_links, antispam_caps, antispam_flood, updated_at)
+            VALUES (?, NULL, 1, 1, 1, 1, ?)
         """, (chat_id, datetime.utcnow().isoformat()))
         await db.commit()
-    return {"chat_id": chat_id, "welcome_text": None, "welcome_enabled": 1}
+    return {
+        "chat_id": chat_id, "welcome_text": None, "welcome_enabled": 1,
+        "welcome_image": None,
+        "antispam_links": 1, "antispam_caps": 1, "antispam_flood": 1,
+    }
 
 
 async def set_welcome_text(chat_id, text):
@@ -873,6 +920,33 @@ async def set_welcome_text(chat_id, text):
                 updated_at=excluded.updated_at
         """, (chat_id, text, datetime.utcnow().isoformat()))
         await db.commit()
+
+
+async def set_welcome_image(chat_id, file_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO chat_settings (chat_id, welcome_image, welcome_enabled, updated_at)
+            VALUES (?, ?, 1, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                welcome_image=excluded.welcome_image,
+                updated_at=excluded.updated_at
+        """, (chat_id, file_id, datetime.utcnow().isoformat()))
+        await db.commit()
+
+
+async def toggle_chat_setting(chat_id, key):
+    """key in: welcome_enabled, antispam_links, antispam_caps, antispam_flood."""
+    if key not in ("welcome_enabled", "antispam_links",
+                   "antispam_caps", "antispam_flood"):
+        return None
+    s = await get_chat_settings(chat_id)
+    new_val = 0 if s.get(key) else 1
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE chat_settings SET {}=?, updated_at=? WHERE chat_id=?".format(key),
+            (new_val, datetime.utcnow().isoformat(), chat_id))
+        await db.commit()
+    return new_val
 
 
 # ---------- MEDIA CACHE ----------
@@ -1285,16 +1359,18 @@ class AntiSpamMiddleware(BaseMiddleware):
         if is_command(event):
             return await handler(event, data)
 
+        s = await get_chat_settings(chat.id)
+
         text = event.text or event.caption or ""
         reason = None
         if text:
             if USERNAME_ONLY_REGEX.match(text.strip()):
                 pass
-            elif has_link(text):
+            elif s.get("antispam_links", 1) and has_link(text):
                 reason = "ссылка"
-            if reason is None and is_caps(text):
+            if reason is None and s.get("antispam_caps", 1) and is_caps(text):
                 reason = "капс"
-        if reason is None:
+        if reason is None and s.get("antispam_flood", 1):
             fp = message_fingerprint(event)
             if fp != "unknown" and is_flood(chat.id, user.id, fp):
                 reason = "флуд"
@@ -1346,7 +1422,9 @@ class AntiSpamMiddleware(BaseMiddleware):
 def user_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚨 Пожаловаться", callback_data="report_start")],
-        [InlineKeyboardButton(text="🔎 Проверить меня", callback_data="check_me")],
+        [InlineKeyboardButton(text="🔎 Проверить себя", callback_data="check_me")],
+        [InlineKeyboardButton(text="👤 Проверить пользователя",
+                              callback_data="user_check_start")],
         [InlineKeyboardButton(text="⚖️ Обжаловать решение", callback_data="appeal_start")],
     ])
 
@@ -1355,14 +1433,20 @@ def staff_menu(role: str):
     rows = [
         [InlineKeyboardButton(text="📨 Жалобы", callback_data="staff:reports")],
         [InlineKeyboardButton(text="⚖️ Апелляции", callback_data="staff:appeals")],
+        [InlineKeyboardButton(text="🔎 Проверить пользователя",
+                              callback_data="user_check_start")],
         [InlineKeyboardButton(text="➕ Изменить статус", callback_data="admin_set_status")],
         [InlineKeyboardButton(text="⛔ Забанить везде", callback_data="admin_ban_anywhere")],
         [InlineKeyboardButton(text="🔁 Сбросить статус", callback_data="admin_reset_status")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="⚙️ Мои группы", callback_data="staff:settings_list")],
     ]
     if role in (ROLE_SUPER, ROLE_ADMIN):
         rows.append([InlineKeyboardButton(text="🎭 Управление ролями",
                                            callback_data="admin_roles")])
+    if role in (ROLE_SUPER, ROLE_ADMIN):
+        rows.append([InlineKeyboardButton(text="📢 Рассылка",
+                                           callback_data="broadcast_start")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1454,15 +1538,38 @@ def conv_staff_reply_kb(kind, ref_id, conv_id):
     ])
 
 
-def settings_menu(chat_id):
+def settings_menu(chat_id, s: dict):
+    w_on = "✅" if s.get("welcome_enabled") else "❌"
+    a_links = "✅" if s.get("antispam_links") else "❌"
+    a_caps = "✅" if s.get("antispam_caps") else "❌"
+    a_flood = "✅" if s.get("antispam_flood") else "❌"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✏️ Приветствие",
+        [InlineKeyboardButton(text="✏️ Текст приветствия",
                               callback_data="settings:welcome:" + str(chat_id))],
-        [InlineKeyboardButton(text="🔒 Добавить подписку",
+        [InlineKeyboardButton(text="🖼 Картинка приветствия",
+                              callback_data="settings:welcome_img:" + str(chat_id))],
+        [InlineKeyboardButton(text=w_on + " Приветствие",
+                              callback_data="settings:toggle:welcome_enabled:" + str(chat_id))],
+        [InlineKeyboardButton(text=a_links + " Блок ссылок",
+                              callback_data="settings:toggle:antispam_links:" + str(chat_id))],
+        [InlineKeyboardButton(text=a_caps + " Блок капса",
+                              callback_data="settings:toggle:antispam_caps:" + str(chat_id))],
+        [InlineKeyboardButton(text=a_flood + " Блок флуда",
+                              callback_data="settings:toggle:antispam_flood:" + str(chat_id))],
+        [InlineKeyboardButton(text="🔒 Добавить обязательную подписку",
                               callback_data="settings:required:" + str(chat_id))],
-        [InlineKeyboardButton(text="📋 Список подписок",
+        [InlineKeyboardButton(text="📋 Список обязательных подписок",
                               callback_data="settings:list:" + str(chat_id))],
     ])
+
+
+def settings_chats_kb(chats):
+    rows = []
+    for c in chats:
+        rows.append([InlineKeyboardButton(
+            text=("⚙️ " + (c["title"] or str(c["chat_id"])))[:60],
+            callback_data="settings:open:" + str(c["chat_id"]))])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def remgroup_kb(chat_id, reqs):
@@ -1475,11 +1582,22 @@ def remgroup_kb(chat_id, reqs):
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
 
+def broadcast_confirm_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Отправить", callback_data="broadcast_send")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="broadcast_cancel")],
+    ])
+
+
 # ==========================================================
 # FSM
 # ==========================================================
 class ReportFSM(StatesGroup):
     waiting_evidence = State()
+
+
+class UserCheckFSM(StatesGroup):
+    waiting_target = State()
 
 
 class AppealFSM(StatesGroup):
@@ -1500,8 +1618,14 @@ class StaffFSM(StatesGroup):
 
 class SettingsFSM(StatesGroup):
     waiting_welcome = State()
+    waiting_welcome_img = State()
     waiting_req_chat = State()
     waiting_req_time = State()
+
+
+class BroadcastFSM(StatesGroup):
+    waiting_content = State()
+    waiting_confirm = State()
 
 
 # ==========================================================
@@ -1556,29 +1680,37 @@ async def user_start(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
     role = await get_user_role(message.from_user.id)
 
+    text = "👋 Привет! Это <b>" + BOT_NAME + "</b>.\n"
     if role in (ROLE_SUPER, ROLE_ADMIN, ROLE_MODERATOR):
-        await message.answer(
-            "👋 <b>" + BOT_NAME + "</b>\n"
-            "Роль: " + ROLE_LABELS[role] + "\n\n"
-            "/admin — панель управления\n"
-            "/roles — управление ролями (super/admin)"
-        )
-        return
+        text += "Твоя роль: " + ROLE_LABELS[role] + "\n"
+        text += "Панель модератора: /admin\n\n"
+    else:
+        text += "\n"
 
-    text = (
-        "👋 Привет! Это <b>" + BOT_NAME + "</b>.\n\n"
-        "Я помогаю собирать информацию о скамерах и проверять пользователей.\n\n"
+    text += (
         "📌 Что я умею:\n"
-        "• 🚨 <b>Пожаловаться</b> на пользователя прямо здесь\n"
-        "• 🔎 Проверить свой статус\n"
-        "• ⚖️ Обжаловать решение модератора\n"
+        "• 🚨 <b>Пожаловаться</b> — пришли ID/@username и доказательства\n"
+        "• 🔎 <b>Проверить себя</b> — узнать свой статус\n"
+        "• 👤 <b>Проверить пользователя</b> — узнать статус любого\n"
+        "• ⚖️ <b>Обжаловать решение</b> — если считаешь модерацию ошибкой\n"
         "• В группе: <code>/check</code>, <code>/report</code>, "
         "<code>/settings</code> (админ группы)\n\n"
-        "Жалобы рассматривают модераторы. Они могут ответить тебе в боте."
+        "🆔 Бот запоминает твой ID — даже если сменишь @username, "
+        "тебя найдут по ID.\n\n"
+        "Жалобы рассматривают модераторы. Они могут ответить тебе прямо в боте."
     )
+
     await send_photo_cached(message, None, IMAGE_START, text,
                             reply_markup=user_menu(),
                             cache_prefix="banner")
+
+
+@router_user.message(Command("cancel"), IsPrivateChat())
+@router_staff.message(Command("cancel"), IsPrivateChat())
+@router_group.message(Command("cancel"), IsGroupChat())
+async def cmd_cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("OK, отменил. Жми /start.")
 
 
 @router_user.callback_query(F.data == "check_me", IsPrivateChat())
@@ -1590,6 +1722,84 @@ async def check_me(cb: CallbackQuery):
         u = await get_user(cb.from_user.id)
     await safe_answer(cb)
     await send_status_card(cb.message, u)
+
+
+# ==========================================================
+# USER: ПРОВЕРКА ПОЛЬЗОВАТЕЛЯ ПРЯМО В БОТЕ# ==========================================================
+@router_user.callback_query(F.data == "user_check_start")
+async def user_check_start(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
+    await state.set_state(UserCheckFSM.waiting_target)
+    await cb.message.answer(
+        "🔎 <b>Проверка пользователя</b>\n\n"
+        "Отправь одно из:\n"
+        "• <code>@username</code>\n"
+        "• <code>123456789</code> (ID)\n"
+        "• перешли мне любое его сообщение\n\n"
+        "💡 <b>Важно:</b> бот запоминает ID — если человек сменил @username, "
+        "то по старому @username или по ID я его найду."
+    )
+
+
+@router_user.message(UserCheckFSM.waiting_target, IsPrivateChat())
+async def user_check_process(message: Message, state: FSMContext):
+    # Пересланное сообщение
+    if message.forward_from:
+        u = message.forward_from
+        await upsert_user(u.id, u.username, u.full_name)
+        data = await get_user(u.id)
+        await state.clear()
+        await send_status_card(message, data or {
+            "user_id": u.id, "username": u.username,
+            "full_name": u.full_name, "status": STATUS_NORMAL,
+            "reason": None, "evidence_url": None,
+        })
+        return
+
+    if message.forward_from_chat:
+        c = message.forward_from_chat
+        await state.clear()
+        await send_status_card(message, {
+            "user_id": c.id, "username": c.username,
+            "full_name": c.title, "status": STATUS_NORMAL,
+            "reason": None, "evidence_url": None,
+        })
+        return
+
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("❗ Отправь @username, ID или перешли сообщение.")
+        return
+
+    target_id = None
+    target_username = None
+    for p in text.split():
+        if p.startswith("@"):
+            target_username = p[1:]
+        elif p.lstrip("-").isdigit():
+            target_id = int(p)
+
+    user = None
+    if target_id:
+        user = await get_user(target_id)
+    if not user and target_username:
+        user = await get_user_by_username(target_username)
+
+    await state.clear()
+
+    if user:
+        await send_status_card(message, user)
+    else:
+        # Не нашли в базе — просто отдаём обычную карточку
+        shown_id = target_id if target_id else "—"
+        shown_username = target_username if target_username else "—"
+        await message.answer(
+            "📇 <b>Проверка</b>\n"
+            "ID: <code>" + str(shown_id) + "</code>\n"
+            "Юзернейм: @" + str(shown_username) + "\n"
+            "Статус: " + STATUS_LABELS[STATUS_NORMAL] + "\n\n"
+            "<i>Пользователь не найден в базе.</i>"
+        )
 
 
 # ==========================================================
@@ -1698,7 +1908,8 @@ async def appeal_start(cb: CallbackQuery, state: FSMContext):
     await state.set_state(AppealFSM.waiting_evidence)
     await cb.message.answer(
         "⚖️ <b>Обжалование</b>\n\n"
-        "Отправь одним сообщением доказательства: текст, фото или видео."
+        "Отправь одним сообщением доказательства, почему решение неверно: "
+        "текст, фото или видео."
     )
 
 
@@ -1803,7 +2014,9 @@ async def admin_cmd(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
         "🛠 <b>" + BOT_NAME + "</b> — панель\n" +
-        "Роль: " + ROLE_LABELS[role],
+        "Роль: " + ROLE_LABELS[role] + "\n\n"
+        "Здесь: жалобы, апелляции, статусы, проверка пользователей, "
+        "управление группами.",
         reply_markup=staff_menu(role)
     )
 
@@ -1886,6 +2099,126 @@ async def role_set_apply(cb: CallbackQuery, state: FSMContext, bot: Bot):
         ROLE_LABELS[new_role] + " → <code>" + str(target_id) + "</code>")
     await cb.message.answer("✅ Роль: " + ROLE_LABELS[new_role])
     await state.clear()
+
+
+# ==========================================================
+# STAFF: РАССЫЛКА
+# ==========================================================
+@router_staff.callback_query(F.data == "broadcast_start")
+async def broadcast_start(cb: CallbackQuery, state: FSMContext):
+    role = await get_user_role(cb.from_user.id)
+    if role not in (ROLE_SUPER, ROLE_ADMIN):
+        await safe_answer(cb, "Нет доступа", alert=True)
+        return
+    await safe_answer(cb)
+    await state.set_state(BroadcastFSM.waiting_content)
+    await cb.message.answer(
+        "📢 <b>Рассылка</b>\n\n"
+        "Отправь сообщение, которое хочешь разослать во все группы, где есть бот.\n\n"
+        "Поддерживается:\n"
+        "• текст с любым форматированием (жирный, курсив, код, ссылки, "
+        "спойлеры и т.д.) — уйдёт 1-в-1\n"
+        "• фото с подписью\n"
+        "• видео с подписью\n"
+        "• GIF/анимация\n\n"
+        "⚠️ Перед отправкой покажу превью и попрошу подтверждение."
+    )
+
+
+@router_staff.message(BroadcastFSM.waiting_content, IsPrivateChat())
+async def broadcast_content(message: Message, state: FSMContext):
+    role = await get_user_role(message.from_user.id)
+    if role not in (ROLE_SUPER, ROLE_ADMIN):
+        await state.clear()
+        return
+
+    # Сохраняем «снимок» сообщения, чтобы затем отправить 1-в-1
+    payload = {
+        "text": message.html_text if message.text else None,
+        "caption": message.html_text if message.caption else None,
+        "photo_id": message.photo[-1].file_id if message.photo else None,
+        "video_id": message.video.file_id if message.video else None,
+        "animation_id": message.animation.file_id if message.animation else None,
+        "entities": True,
+    }
+    await state.update_data(payload=payload)
+    await state.set_state(BroadcastFSM.waiting_confirm)
+
+    preview = "📢 <b>Превью рассылки</b>\n\n"
+    try:
+        if payload["photo_id"]:
+            await message.answer_photo(payload["photo_id"],
+                caption="📢 <b>Превью</b>\n\n" + (payload["caption"] or ""),
+                reply_markup=broadcast_confirm_kb())
+        elif payload["video_id"]:
+            await message.answer_video(payload["video_id"],
+                caption="📢 <b>Превью</b>\n\n" + (payload["caption"] or ""),
+                reply_markup=broadcast_confirm_kb())
+        elif payload["animation_id"]:
+            await message.answer_animation(payload["animation_id"],
+                caption="📢 <b>Превью</b>\n\n" + (payload["caption"] or ""),
+                reply_markup=broadcast_confirm_kb())
+        else:
+            await message.answer(preview + (payload["text"] or "—"),
+                reply_markup=broadcast_confirm_kb())
+    except Exception as e:
+        log.warning("broadcast preview: %s", e)
+        await message.answer("Ошибка превью: " + str(e))
+
+
+@router_staff.callback_query(F.data == "broadcast_send")
+async def broadcast_send(cb: CallbackQuery, state: FSMContext, bot: Bot):
+    role = await get_user_role(cb.from_user.id)
+    if role not in (ROLE_SUPER, ROLE_ADMIN):
+        await safe_answer(cb, "Нет доступа", alert=True)
+        return
+
+    data = await state.get_data()
+    payload = data.get("payload")
+    if not payload:
+        await safe_answer(cb, "Потерян payload", alert=True)
+        return
+
+    await safe_answer(cb, "Рассылка пошла")
+
+    chats = await list_all_chats()
+    sent = 0
+    failed = 0
+
+    for c in chats:
+        cid = c["chat_id"]
+        try:
+            if payload.get("photo_id"):
+                await bot.send_photo(cid, payload["photo_id"],
+                    caption=payload.get("caption") or None)
+            elif payload.get("video_id"):
+                await bot.send_video(cid, payload["video_id"],
+                    caption=payload.get("caption") or None)
+            elif payload.get("animation_id"):
+                await bot.send_animation(cid, payload["animation_id"],
+                    caption=payload.get("caption") or None)
+            else:
+                await bot.send_message(cid, payload.get("text") or "—")
+            sent += 1
+        except Exception as e:
+            failed += 1
+            log.warning("Broadcast to %s: %s", cid, e)
+
+    await state.clear()
+    await cb.message.answer(
+        "📢 <b>Готово</b>\n"
+        "Отправлено: " + str(sent) + "\n"
+        "Ошибок: " + str(failed)
+    )
+    await send_log(bot, "📢 " + user_mention(cb.from_user) +
+                        " сделал рассылку в " + str(sent) + " чатов")
+
+
+@router_staff.callback_query(F.data == "broadcast_cancel")
+async def broadcast_cancel(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb, "Отменено")
+    await state.clear()
+    await cb.message.answer("❌ Рассылка отменена.")
 
 
 # ---- Жалобы: список ----
@@ -2490,6 +2823,8 @@ async def admin_stats(cb: CallbackQuery):
         rp_pending = (await cur.fetchone())[0]
         cur = await db.execute("SELECT COUNT(*) FROM reports")
         rp_total = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT COUNT(*) FROM chats")
+        chats = (await cur.fetchone())[0]
 
     await cb.message.answer(
         "📊 <b>Статистика</b>\n"
@@ -2498,60 +2833,157 @@ async def admin_stats(cb: CallbackQuery):
         "⛔ Забанено: " + str(banned) + "\n"
         "🛡 Модераторов: " + str(mods) + "\n"
         "🛠 Админов: " + str(admins) + "\n"
+        "💬 Чатов: " + str(chats) + "\n"
         "🚨 Жалоб новых: " + str(rp_pending) + " (всего " + str(rp_total) + ")\n"
         "⚖️ Апелляций новых: " + str(ap_pending)
     )
 
 
 # ==========================================================
-# GROUP: /settings /check /report
+# STAFF: Мои группы (список)
 # ==========================================================
+@router_staff.callback_query(F.data == "staff:settings_list")
+async def staff_settings_list(cb: CallbackQuery, bot: Bot):
+    role = await get_user_role(cb.from_user.id)
+    if role not in (ROLE_SUPER, ROLE_ADMIN, ROLE_MODERATOR):
+        await safe_answer(cb, "Нет доступа", alert=True)
+        return
+    await safe_answer(cb)
+    chats = await list_all_chats()
+    my = []
+    for c in chats:
+        try:
+            m = await bot.get_chat_member(c["chat_id"], cb.from_user.id)
+            if m.status in (ChatMemberStatus.CREATOR, ChatMemberStatus.ADMINISTRATOR):
+                my.append(c)
+        except Exception:
+            continue
+    if not my:
+        await cb.message.answer("ℹ️ Ты не админ ни в одной группе с ботом.")
+        return
+    await cb.message.answer("⚙️ Выбери группу:",
+                             reply_markup=settings_chats_kb(my))
+
+
+# ==========================================================
+# SETTINGS — в группе и в личке
+# ==========================================================
+async def _show_settings(message_or_cb, chat_id: int, bot: Bot):
+    title = "—"
+    try:
+        chat = await bot.get_chat(chat_id)
+        title = chat.title or chat.full_name or str(chat_id)
+    except Exception:
+        pass
+
+    s = await get_chat_settings(chat_id)
+    welcome = s.get("welcome_text") or "<i>не задано — стандартное</i>"
+    img_status = "✅ задана" if s.get("welcome_image") else "❌ не задана"
+    reqs = await list_required_chats(chat_id)
+
+    w_on = "✅ вкл" if s.get("welcome_enabled") else "❌ выкл"
+    a_links = "✅ вкл" if s.get("antispam_links") else "❌ выкл"
+    a_caps = "✅ вкл" if s.get("antispam_caps") else "❌ выкл"
+    a_flood = "✅ вкл" if s.get("antispam_flood") else "❌ выкл"
+
+    text = (
+        "⚙️ <b>Настройки группы</b>\n"
+        "📛 <b>" + title + "</b>\n\n"
+
+        "👋 <b>Приветствие</b>: " + w_on + "\n"
+        "  • Текст:\n" + welcome + "\n"
+        "  • Картинка: " + img_status + "\n"
+        "  • Переменные: <code>{group_name}</code>, <code>{username}</code>\n\n"
+
+        "🛡 <b>Антиспам</b>:\n"
+        "  • Ссылки: " + a_links + "\n"
+        "  • Капс: " + a_caps + "\n"
+        "  • Флуд: " + a_flood + "\n\n"
+
+        "🔒 <b>Обязательных подписок:</b> " + str(len(reqs)) + "\n\n"
+
+        "💡 Нажми на кнопку ниже, чтобы изменить."
+    )
+
+    kb = settings_menu(chat_id, s)
+    if hasattr(message_or_cb, "answer"):
+        await message_or_cb.answer(text, reply_markup=kb,
+                                    disable_web_page_preview=True)
+
+
+# --- /settings в группе ---
 @router_group.message(Command("settings"), IsGroupChat())
-async def cmd_settings(message: Message, bot: Bot):
+async def cmd_settings_group(message: Message, bot: Bot):
     if not await is_chat_admin(bot, message.chat.id, message.from_user.id):
         await message.reply("⛔ Только админы группы.")
         return
-    chat_id = message.chat.id
-    s = await get_chat_settings(chat_id)
-    welcome = s.get("welcome_text") or "<i>не задано — стандартное</i>"
-    reqs = await list_required_chats(chat_id)
-
-    text = (
-        "⚙️ <b>Настройки группы</b>\n\n"
-        "<b>Приветствие:</b>\n" + welcome + "\n\n"
-        "<b>Обязательных подписок:</b> " + str(len(reqs)) + "\n\n"
-        "💡 Переменные: <code>{group_name}</code>, <code>{username}</code>"
-    )
-    await message.reply(text, reply_markup=settings_menu(chat_id))
+    await _show_settings(message, message.chat.id, bot)
 
 
-def settings_menu(chat_id):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✏️ Приветствие",
-                              callback_data="settings:welcome:" + str(chat_id))],
-        [InlineKeyboardButton(text="🔒 Добавить подписку",
-                              callback_data="settings:required:" + str(chat_id))],
-        [InlineKeyboardButton(text="📋 Список подписок",
-                              callback_data="settings:list:" + str(chat_id))],
-    ])
+# --- /settings в личке ---
+@router_user.message(Command("settings"), IsPrivateChat())
+async def cmd_settings_private(message: Message, bot: Bot):
+    chats = await list_all_chats()
+    my = []
+    for c in chats:
+        try:
+            m = await bot.get_chat_member(c["chat_id"], message.from_user.id)
+            if m.status in (ChatMemberStatus.CREATOR, ChatMemberStatus.ADMINISTRATOR):
+                my.append(c)
+        except Exception:
+            continue
+
+    if not my:
+        await message.answer(
+            "ℹ️ Ты не админ ни одной группы, где есть бот.\n\n"
+            "Добавь бота в свою группу и выдай ему права админа."
+        )
+        return
+    if len(my) == 1:
+        await _show_settings(message, my[0]["chat_id"], bot)
+        return
+    await message.answer("⚙️ Выбери группу:",
+                          reply_markup=settings_chats_kb(my))
 
 
-@router_group.callback_query(F.data.startswith("settings:welcome:"))
-async def cb_settings_welcome(cb: CallbackQuery, state: FSMContext, bot: Bot):
+@router_user.callback_query(F.data.startswith("settings:open:"))
+async def cb_settings_open(cb: CallbackQuery, bot: Bot):
     chat_id = int(cb.data.split(":")[2])
     if not await is_chat_admin(bot, chat_id, cb.from_user.id):
         await safe_answer(cb, "Нет доступа", alert=True)
         return
     await safe_answer(cb)
+    await _show_settings(cb.message, chat_id, bot)
+
+
+# --- Приветствие: текст ---
+@router_user.callback_query(F.data.startswith("settings:welcome:"))
+@router_group.callback_query(F.data.startswith("settings:welcome:"))
+async def cb_settings_welcome(cb: CallbackQuery, state: FSMContext, bot: Bot):
+    # не путать с settings:welcome_img
+    parts = cb.data.split(":")
+    if len(parts) != 3:
+        await safe_answer(cb)
+        return
+    chat_id = int(parts[2])
+    if not await is_chat_admin(bot, chat_id, cb.from_user.id):
+        await safe_answer(cb, "Нет доступа", alert=True)
+        return
+    await safe_answer(cb)
     await state.set_state(SettingsFSM.waiting_welcome)
-    await state.update_data(chat_id=chat_id)
+    await state.update_data(chat_id=chat_id,
+                            from_private=cb.message.chat.type == "private")
     await cb.message.answer(
-        "✏️ Отправь текст приветствия.\n"
-        "Переменные: <code>{group_name}</code>, <code>{username}</code>\n"
-        "Отправь <code>-</code>, чтобы сбросить."
+        "✏️ Отправь новый текст приветствия.\n\n"
+        "Переменные:\n"
+        "• <code>{group_name}</code> — название группы\n"
+        "• <code>{username}</code> — упоминание нового участника\n\n"
+        "Пример: <code>Добро пожаловать в {group_name}, {username}! 🎉</code>\n\n"
+        "Отправь <code>-</code>, чтобы сбросить на стандартный."
     )
 
 
+@router_user.message(SettingsFSM.waiting_welcome, IsPrivateChat())
 @router_group.message(SettingsFSM.waiting_welcome, IsGroupChat())
 async def settings_set_welcome(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
@@ -2567,9 +2999,81 @@ async def settings_set_welcome(message: Message, state: FSMContext, bot: Bot):
         text = None
     await set_welcome_text(chat_id, text)
     await state.clear()
-    await message.reply("✅ Обновлено.")
+    await message.reply("✅ Текст приветствия обновлён.")
+    if data.get("from_private"):
+        await _show_settings(message, chat_id, bot)
 
 
+# --- Приветствие: картинка ---
+@router_user.callback_query(F.data.startswith("settings:welcome_img:"))
+@router_group.callback_query(F.data.startswith("settings:welcome_img:"))
+async def cb_settings_welcome_img(cb: CallbackQuery, state: FSMContext, bot: Bot):
+    chat_id = int(cb.data.split(":")[2])
+    if not await is_chat_admin(bot, chat_id, cb.from_user.id):
+        await safe_answer(cb, "Нет доступа", alert=True)
+        return
+    await safe_answer(cb)
+    await state.set_state(SettingsFSM.waiting_welcome_img)
+    await state.update_data(chat_id=chat_id,
+                            from_private=cb.message.chat.type == "private")
+    await cb.message.answer(
+        "🖼 Отправь картинку для приветствия (одним фото).\n"
+        "Отправь <code>-</code>, чтобы убрать."
+    )
+
+
+@router_user.message(SettingsFSM.waiting_welcome_img, IsPrivateChat())
+@router_group.message(SettingsFSM.waiting_welcome_img, IsGroupChat())
+async def settings_set_welcome_img(message: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    chat_id = data.get("chat_id")
+    if not chat_id:
+        await state.clear()
+        return
+    if not await is_chat_admin(bot, chat_id, message.from_user.id):
+        await state.clear()
+        return
+    if (message.text or "").strip() == "-":
+        await set_welcome_image(chat_id, None)
+        await state.clear()
+        await message.reply("✅ Картинка убрана.")
+        if data.get("from_private"):
+            await _show_settings(message, chat_id, bot)
+        return
+    if not message.photo:
+        await message.reply("❗ Отправь фото или <code>-</code>.")
+        return
+    await set_welcome_image(chat_id, message.photo[-1].file_id)
+    await state.clear()
+    await message.reply("✅ Картинка приветствия обновлена.")
+    if data.get("from_private"):
+        await _show_settings(message, chat_id, bot)
+
+
+# --- Переключатели ---
+@router_user.callback_query(F.data.startswith("settings:toggle:"))
+@router_group.callback_query(F.data.startswith("settings:toggle:"))
+async def cb_settings_toggle(cb: CallbackQuery, bot: Bot):
+    parts = cb.data.split(":")
+    # settings:toggle:<key>:<chat_id>
+    if len(parts) != 4:
+        await safe_answer(cb)
+        return
+    _, _, key, chat_id_str = parts
+    chat_id = int(chat_id_str)
+    if not await is_chat_admin(bot, chat_id, cb.from_user.id):
+        await safe_answer(cb, "Нет доступа", alert=True)
+        return
+    new_val = await toggle_chat_setting(chat_id, key)
+    if new_val is None:
+        await safe_answer(cb, "Неизвестный параметр", alert=True)
+        return
+    await safe_answer(cb, "Вкл" if new_val else "Выкл")
+    await _show_settings(cb.message, chat_id, bot)
+
+
+# --- Добавить подписку ---
+@router_user.callback_query(F.data.startswith("settings:required:"))
 @router_group.callback_query(F.data.startswith("settings:required:"))
 async def cb_settings_required(cb: CallbackQuery, state: FSMContext, bot: Bot):
     chat_id = int(cb.data.split(":")[2])
@@ -2578,10 +3082,16 @@ async def cb_settings_required(cb: CallbackQuery, state: FSMContext, bot: Bot):
         return
     await safe_answer(cb)
     await state.set_state(SettingsFSM.waiting_req_chat)
-    await state.update_data(chat_id=chat_id)
-    await cb.message.answer("🔒 Отправь ссылку на канал/группу (@name или https://t.me/name).")
+    await state.update_data(chat_id=chat_id,
+                            from_private=cb.message.chat.type == "private")
+    await cb.message.answer(
+        "🔒 Отправь ссылку на канал/группу для обязательной подписки:\n"
+        "Например: <code>@mychannel</code> или <code>https://t.me/mychannel</code>\n\n"
+        "⚠️ Бот должен быть добавлен в этот канал/группу."
+    )
 
 
+@router_user.message(SettingsFSM.waiting_req_chat, IsPrivateChat())
 @router_group.message(SettingsFSM.waiting_req_chat, IsGroupChat())
 async def settings_set_req_chat(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
@@ -2607,10 +3117,11 @@ async def settings_set_req_chat(message: Message, state: FSMContext, bot: Bot):
     await state.update_data(req_chat_id=req_chat_id,
                             req_username=username, title=title, link=link)
     await state.set_state(SettingsFSM.waiting_req_time)
-    await message.reply("⏱ Срок: <code>30m</code>, <code>1h</code>, "
-                        "<code>7d</code>, <code>0</code>.")
+    await message.reply("⏱ Срок действия: <code>30m</code>, <code>1h</code>, "
+                        "<code>7d</code> или <code>0</code> (бессрочно).")
 
 
+@router_user.message(SettingsFSM.waiting_req_time, IsPrivateChat())
 @router_group.message(SettingsFSM.waiting_req_time, IsGroupChat())
 async def settings_set_req_time(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
@@ -2637,10 +3148,14 @@ async def settings_set_req_time(message: Message, state: FSMContext, bot: Bot):
     )
     await log_action(message.from_user.id, "add_required_chat", chat_id,
                      "req=" + str(data.get("req_username")))
-    await message.reply("✅ Добавлено.")
+    await message.reply("✅ Подписка добавлена.")
     await state.clear()
+    if data.get("from_private"):
+        await _show_settings(message, chat_id, bot)
 
 
+# --- Список подписок ---
+@router_user.callback_query(F.data.startswith("settings:list:"))
 @router_group.callback_query(F.data.startswith("settings:list:"))
 async def cb_settings_list(cb: CallbackQuery, bot: Bot):
     chat_id = int(cb.data.split(":")[2])
@@ -2662,6 +3177,7 @@ async def cb_settings_list(cb: CallbackQuery, bot: Bot):
                              disable_web_page_preview=True)
 
 
+@router_user.callback_query(F.data.startswith("remgroup:"))
 @router_group.callback_query(F.data.startswith("remgroup:"))
 async def cb_remgroup(cb: CallbackQuery, bot: Bot):
     _, chat_id_str, req_id_str = cb.data.split(":")
@@ -2680,6 +3196,9 @@ async def cb_remgroup(cb: CallbackQuery, bot: Bot):
         pass
 
 
+# ==========================================================
+# GROUP: /check, /report
+# ==========================================================
 @router_group.message(Command("check"), IsGroupChat())
 async def cmd_check(message: Message):
     target_id = None
@@ -2751,6 +3270,9 @@ async def cmd_report(message: Message, bot: Bot):
     )
 
 
+# ==========================================================
+# GROUP: приветствие, кик
+# ==========================================================
 @router_group.chat_member()
 async def on_chat_member(event: ChatMemberUpdated, bot: Bot):
     new = event.new_chat_member
@@ -2772,9 +3294,15 @@ async def on_chat_member(event: ChatMemberUpdated, bot: Bot):
             else:
                 text = ("👋 Добро пожаловать в <b>" + (event.chat.title or "этот чат") +
                         "</b>, " + mention + "!\n\nПриятного общения! 🎉")
+
+            welcome_img = s.get("welcome_image")
             try:
-                await send_photo_cached(bot, event.chat.id, IMAGE_HELLO, text,
-                                        cache_prefix="banner")
+                if welcome_img:
+                    await bot.send_photo(event.chat.id, welcome_img,
+                        caption=_cut_caption(text))
+                else:
+                    await send_photo_cached(bot, event.chat.id, IMAGE_HELLO, text,
+                                            cache_prefix="banner")
             except Exception as e:
                 log.warning("Приветствие: %s", e)
 
